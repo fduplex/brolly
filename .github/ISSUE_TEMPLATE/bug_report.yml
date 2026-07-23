@@ -1,0 +1,43 @@
+name: Bug report
+description: Something in brolly isn't working as documented.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you run, what did you expect, and what happened instead?
+      placeholder: |
+        $ brolly refresh corp-prod
+        ...
+    validations:
+      required: true
+  - type: input
+    id: brolly-version
+    attributes:
+      label: brolly version
+      description: "Output of `pip show brolly` (or `uv pip show brolly`)."
+    validations:
+      required: true
+  - type: input
+    id: aws-cli-version
+    attributes:
+      label: AWS CLI version
+      description: "Output of `aws --version`."
+    validations:
+      required: true
+  - type: input
+    id: python-os
+    attributes:
+      label: Python & OS
+      description: "e.g. Python 3.14.1 on macOS 15 / Ubuntu 24.04 / WSL2"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Any error output. Redact account IDs / ARNs you don't want public.
+      render: shell
+    validations:
+      required: false
