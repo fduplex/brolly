@@ -406,6 +406,10 @@ def cmd_credential_process(profile: ProfileName) -> None:
             f"token rejected for session '{session_name}' — run: brolly secure login -s {session_name}"
         ) from None
 
+    # The credential_process contract *is* to write the credentials as JSON on stdout, which the calling SDK
+    # reads back over a pipe — this is the protocol's designed channel, not a log sink. Static analysis flags it
+    # as clear-text logging of secrets (CodeQL py/clear-text-logging-sensitive-data); there is no alternative
+    # that still implements credential_process. The credentials are short-lived STS session credentials.
     print(
         json.dumps({
             'Version': 1,
