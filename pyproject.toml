@@ -1,6 +1,6 @@
 [project]
 name = 'brolly'
-version = '0.1.0'
+version = '0.2.0'
 description = 'A pure-Python CLI for AWS IAM Identity Center (SSO)'
 authors = [
   { name = 'Full Duplex Media', email = 'contact@fullduplex.media' }
@@ -23,17 +23,20 @@ classifiers = [
   'Topic :: System :: Systems Administration :: Authentication/Directory'
 ]
 dependencies = [
-  'boto3'
+  'boto3',
+  'keyring>=25',
+  'keyring-pass>=0.9'
 ]
 
 [dependency-groups]
 dev = [
+  'pytest>=8',
   'ruff',
   'ty'
 ]
 
 [project.scripts]
-brolly = 'brolly.cli:app'
+brolly = 'brolly.entry:app'
 
 [project.urls]
 Homepage = 'https://github.com/fduplex/brolly'
@@ -43,6 +46,9 @@ Issues = 'https://github.com/fduplex/brolly/issues'
 [build-system]
 requires = ['uv_build>=0.11.0,<0.12.0']
 build-backend = 'uv_build'
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
 
 [tool.ruff]
 line-length = 120

@@ -1,4 +1,4 @@
-from brolly.cli import app
+from brolly.entry import app
 
 if __name__ == '__main__':
     app()

@@ -22,6 +22,7 @@ brolly login [-s <session>]             force a fresh device-code login for a se
 brolly switch                           repoint the current profile's account/role
 brolly refresh [<profile>] [-s <session>]
 brolly add <profile> [-s <session>]
+brolly secure enable|disable [-s <session>]   opt-in: keep a session's token in your OS keychain
 ```
 
 ## Install
@@ -31,6 +32,8 @@ $ uv tool install brolly      # recommended
 $ pipx install brolly
 $ pip install brolly
 ```
+
+Opt-in [secure mode](#secure-mode-os-keychain) (tokens in the OS keychain) is built in — no extra to install.
 
 **Prerequisites:**
 
@@ -187,74 +190,153 @@ $ brolly switch          # or `brolly` first if the token also expired
 | Need a new profile under a different session, e.g. `customer` | `brolly add <name> -s customer` |
 | Refresh a profile in a different session from this shell | `brolly refresh <profile> -s <session>` |
 | Interrupted a `brolly add` mid-picker | `export AWS_PROFILE=<name>` then `brolly switch` |
+| Keep a session's token out of plaintext | `brolly secure enable -s <session>` |
+
+## Secure mode (OS keychain)
+
+By default brolly is a thin layer over the stock `~/.aws/sso/cache` — the same plaintext token cache the `aws`
+CLI uses. **Secure mode** is an opt-in that moves the SSO token off disk and into your OS keychain (macOS
+Keychain, GNOME Keyring / KWallet, or `pass` + gpg-agent on a desktop-less Linux box — see
+[Choosing a backend](#choosing-a-backend)), then registers brolly as each profile's `credential_process` so every
+SDK and the `aws` CLI keep working with nothing but `$AWS_PROFILE` — no shell wrapper, no plaintext token.
+
+It's built in (the [`keyring`](https://github.com/jaraco/keyring) library ships as a dependency); it just needs a
+keychain backend, which macOS and desktop Linux already have.
+
+### `brolly secure enable [-s <session>]`
+
+Logs the session in (a device-code login brolly runs itself, storing the token in your keychain) and rewrites
+every profile under that session to use `credential_process`. Once the token is safely in the keychain it also
+**deletes the now-redundant plaintext token** from `~/.aws/sso/cache/`, so nothing sensitive is left on disk.
+Idempotent — re-run it after `brolly add` to pull new profiles into secure mode (and to clean up any leftover
+plaintext token from a session you secured before this behavior existed).
+
+```console
+$ brolly secure enable -s corp
+
+To authorize brolly for session 'corp', open:
+
+    https://device.sso.us-east-1.amazonaws.com/?user_code=WXYZ-1234
+
+and confirm the code: WXYZ-1234
+
+✓ authorized — SSO token stored in your OS keychain
+✓ removed plaintext token cache for session 'corp'
+✓ secure mode on for session 'corp' — 3 profile(s) now use the OS keychain
+```
+
+Nothing else about your workflow changes: `export AWS_PROFILE=corp-prod` and every SDK resolves credentials
+through brolly, which pulls the keychain token and vends short-lived role credentials on demand. `brolly`,
+`brolly refresh`, and `brolly switch` all keep working and stay in secure mode.
+
+### `brolly secure login [-s <session>]`
+
+Re-authorizes a secured session, refreshing its keychain token in place. brolly normally refreshes silently
+using the stored refresh token; reach for this only if the 7-day session has fully lapsed (bare `brolly` also
+triggers it automatically when it finds a dead secured session).
+
+### `brolly secure disable [-s <session>]`
+
+Reverts every secured profile under the session back to a stock plaintext-cache SSO profile and deletes the
+token from your keychain — a clean, complete undo of `enable`.
+
+### How it works
+
+- **The token** (with its refresh token) lives in the keychain under service `brolly-sso`, keyed the way botocore
+  keys its own cache (SHA1 of the session name). brolly plugs a keychain-backed cache into botocore's token
+  provider, so **silent hourly refresh still happens** — no reimplementation, just a different vault.
+- **A secured profile** keeps `sso_session` (needed to refresh the token) but moves `sso_account_id` /
+  `sso_role_name` under `brolly_sso_*` and adds `credential_process`. That combination deactivates botocore's
+  built-in SSO credential provider so resolution flows through brolly — otherwise botocore would find the
+  (now-absent) plaintext token and fail instead of falling through.
+- **The prompt pill** reads a small non-secret expiry sidecar (`<aws-config-dir>/brolly/<sha1>.json`) instead of
+  the plaintext cache, so it stays a cheap filesystem check — no keychain access, no secret on disk.
+- **No environment variable to keep exported.** `secure enable` writes the chosen backend to
+  `~/.aws/brolly/config.json` (alongside the sidecars), and every `credential-process` call re-selects it itself —
+  so credential resolution works from any venv, a cron job, or an IDE without `PYTHON_KEYRING_BACKEND` set. (It
+  does run the `brolly` command, so keep brolly on your `PATH`.)
+
+### Choosing a backend
+
+`keyring` needs a real backend, and the one that matters for `credential_process` is one that stays **unlocked
+for your session** — because brolly's `credential-process` is spawned fresh and non-interactively on every cold
+credential resolution, so it can't stop to prompt. macOS Keychain and desktop Linux's gnome-keyring / KWallet
+already work that way (unlocked at login by a session daemon). If `keyring` can't find a backend, brolly says so
+and stops rather than failing obscurely.
+
+`secure enable` **auto-detects** the backend: it uses a real OS keychain if one is active, otherwise it falls back
+to `pass` when its store is set up. So on most machines you don't name a backend at all — and whatever it picks is
+saved to `~/.aws/brolly/config.json` and re-applied on every later call. Override with `--backend <dotted.path>`
+when you want a specific one.
+
+Backends live in **brolly's own environment** — because `credential_process` runs the `brolly` executable, which
+uses brolly's venv, *not* the venv of whatever triggered the credential lookup. The `pass` backend
+(`keyring_pass`) ships with brolly; other backends (e.g. 1Password) you install once alongside brolly
+(`uv tool install brolly --with <pkg>`, or `pipx inject brolly <pkg>`).
+
+**Linux without a desktop (no gnome-keyring / KWallet): use `pass` + gpg-agent.** This is the recommended path —
+`pass` stores each secret gpg-encrypted, and gpg-agent is the session daemon that keeps your key unlocked, so
+reads are silent once it's warm. (Encrypting a *write* needs no passphrase at all, so token refreshes never
+prompt.) `keyring_pass` is bundled, so you only need the `pass` CLI itself and an initialized store — then
+`secure enable` finds it automatically:
+
+```console
+$ sudo apt install pass                              # the pass CLI (system-wide)
+$ pass init <your-gpg-key-id>                        # initialize the store (brolly then auto-detects it)
+$ brolly secure enable -s corp                       # picks pass, saves it to ~/.aws/brolly/config.json
+```
+
+**Unlock gpg-agent once per session.** Because `credential-process` has no TTY, gpg-agent must already be warm
+when it runs — a cold cache would fail. Two ways:
+
+- Keep the agent unlocked all session by raising the cache TTL in `~/.gnupg/gpg-agent.conf`
+  (`max-cache-ttl 34560000`), then do one `pass show` (or `brolly secure enable`) in a terminal at login; the
+  first decrypt prompts once (pinentry-curses, no X11 needed) and the agent caches it.
+- For zero-touch warming at login, preset the passphrase with `gpg-preset-passphrase` (add `allow-preset-passphrase`
+  to `gpg-agent.conf`) — the same pattern used by
+  [borg-backup](https://github.com/thevinchi/borg-backup)'s `borg-backup-passphrase`.
+
+**1Password / other vaults.** Anything with a `keyring` backend works — install it into brolly's env and pass its
+dotted path to `--backend`. For example `onepassword-keyring` with a 1Password service-account token
+(`OP_SERVICE_ACCOUNT_TOKEN`) for non-interactive reads. Note the trade: without the desktop app there's no
+biometric unlock, so you're trusting a long-lived service-account token in your environment.
+
+**Encrypted-file fallback (last resort).** `keyrings.alt`'s `EncryptedKeyring` needs no daemon, but that's the
+problem: it has nothing to keep it unlocked, so it prompts for the master passphrase in *every* new process —
+meaning a prompt on roughly every `aws` call and a hard failure anywhere non-interactive. Only viable for
+occasional interactive use; otherwise the plaintext-cache default is the more honest choice.
+
+```console
+$ uv tool install brolly --with keyrings.alt --with pycryptodome
+$ brolly secure enable -s corp --backend keyrings.alt.file.EncryptedKeyring
+```
+
+See the [keyring docs](https://github.com/jaraco/keyring#using-keyring) for the full backend list.
 
 ## Shell prompt integration
 
-brolly ships a drop-in `__aws_ps1` function for your `~/.bashrc` that renders a colored `AWS_PROFILE` pill
-reflecting the **local, filesystem-only** state of the session token — no network call, no `aws`/boto3
-invocation on every prompt:
+`brolly ps1` renders a colored `AWS_PROFILE` pill for your prompt, reflecting the **local, filesystem-only** state
+of the session token — no network call, no keychain access, no `aws`/boto3 invocation:
 
-- **live** (bright orange) — hourly token still valid.
+- **live** (bright orange) — token still valid.
 - **idle** (grey, clock glyph) — cached but lapsed; refreshes automatically on next use.
 - **gone** (red, cross glyph) — no cached token; run `brolly`.
 - **plain** (neutral grey) — profile has no `sso_session` (not an SSO profile).
 
-A dead 7-day session can't be detected locally, so it still reads as `idle` rather than `gone`. The pill also
-shows the account: `<profile> · <account>`, where `<account>` is the friendly `sso_account_name` when the
-profile has one, falling back to the raw `sso_account_id` if not. Names get populated by `switch`, `add`, and
-`refresh`; until one of those runs against a given profile, the pill just falls back to the raw account ID.
-
-Drop this into your `~/.bashrc` and add `$(__aws_ps1)` to your `PS1`. It needs a **[Nerd Font](https://www.nerdfonts.com/)**
-for the powerline separators and glyphs.
+Add it to your `PS1`. It needs a **[Nerd Font](https://www.nerdfonts.com/)** for the powerline separators and
+glyphs:
 
 ```bash
-__aws_ps1() {
-  [[ -z $AWS_PROFILE ]] && return
-
-  # Cheap, filesystem-only freshness check — no aws/boto3 call, no network.
-  # live = hourly token still valid · idle = cached but lapsed (refreshes on next use) · gone = no token, must log in.
-  # The 7-day session's true death can't be known locally, so a dead session reads as "idle", not "gone".
-  local cfg="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
-  local session acct cache exp now state sbg sfg glyph
-  IFS=$'\t' read -r session acct < <(awk -v h="[profile $AWS_PROFILE]" '
-    $0==h {i=1; next}
-    /^\[/ {i=0}
-    i && /^[[:space:]]*sso_session[[:space:]]*=/      {v=$0; sub(/^[^=]*=[[:space:]]*/,"",v); s=v}
-    i && /^[[:space:]]*sso_account_name[[:space:]]*=/ {v=$0; sub(/^[^=]*=[[:space:]]*/,"",v); n=v}
-    i && /^[[:space:]]*sso_account_id[[:space:]]*=/   {v=$0; sub(/^[^=]*=[[:space:]]*/,"",v); a=v}
-    END {print s "\t" (n!=""?n:a)}' "$cfg" 2>/dev/null)
-
-  if [[ -z $session ]]; then
-    state=plain
-  else
-    cache="$HOME/.aws/sso/cache/$(printf %s "$session" | sha1sum | cut -c1-40).json"
-    if [[ ! -f $cache ]]; then
-      state=gone
-    else
-      exp=$(sed -n 's/.*"expiresAt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cache" | head -1)
-      printf -v now '%(%s)T' -1
-      exp=$(date -d "$exp" +%s 2>/dev/null)
-      [[ -n $exp && $exp -gt $now ]] && state=live || state=idle
-    fi
-  fi
-
-  case $state in
-    live)  sbg=214 sfg=236 glyph='' ;;         # bright AWS orange — creds are live
-    idle)  sbg=240 sfg=214 glyph=$' ' ;; #  grey clock — lapsed, will refresh on next use
-    gone)  sbg=160 sfg=231 glyph=$' ' ;; #  red cross — no cached token, run brolly
-    plain) sbg=238 sfg=250 glyph='' ;;         # non-SSO profile — neutral
-  esac
-
-  # powerline pill:  amazon-glyph | profile ; \001/\002 wrap non-printing bytes for correct prompt-width math
-  local E=$'\033' A=$'\001' B=$'\002' PL=$'' AWS=$''
-  printf '%s%s%s%s%s' \
-    "${A}${E}[48;5;238;38;5;214;1m${B} ${AWS} " \
-    "${A}${E}[38;5;238;48;5;${sbg}m${B}${PL}" \
-    "${A}${E}[48;5;${sbg};38;5;${sfg};1m${B} ${glyph}${AWS_PROFILE}${acct:+ · $acct} " \
-    "${A}${E}[0;38;5;${sbg}m${B}${PL}" \
-    "${A}${E}[0m${B} "
-}
+export PS1='$(brolly ps1)\u@\h:\w\$ '
 ```
+
+It reads whichever store the profile actually uses — the non-secret expiry sidecar for
+[secure-mode](#secure-mode-os-keychain) profiles, or the stock plaintext cache otherwise — so it stays accurate
+either way, with no configuration. A dead 7-day session can't be detected locally, so it reads as `idle` rather
+than `gone`. The pill shows `<profile> · <account>`, preferring the friendly `sso_account_name` and falling back
+to the raw account ID (names get populated by `switch`, `add`, and `refresh`).
+
+Cost is ~10ms per prompt: one short-lived process that reads two local files and deliberately never imports boto3.
 
 ## How it compares
 
@@ -270,8 +352,9 @@ pure-Python/pip.
   static profiles. brolly is deliberately thinner: no wrapper, no bulk generation, in-place edits only.
 - **[awsume](https://awsu.me/)** targets classic IAM role assumption, not Identity Center.
 
-This is positioning, not disparagement — if you want OS-keychain-encrypted tokens today, reach for aws-vault,
-granted, or aws-sso-cli (see caveats below and the roadmap).
+This is positioning, not disparagement. brolly's plaintext default is deliberately thin; when you want tokens in
+the OS keychain, that's an opt-in [secure mode](#secure-mode-os-keychain) rather than the always-on model of
+aws-vault, granted, or aws-sso-cli.
 
 ## Design notes & caveats
 
@@ -281,22 +364,20 @@ Two things to own up front:
   account/role of a profile name silently retargets *any other shell* pinned to the **same profile name** on its
   next command. Safe use = **one distinct profile name per concurrent context.** If you keep two shells on the
   same account simultaneously, give them different profile names. This is the one real footgun — stated plainly.
-- **Tokens live in the stock plaintext `~/.aws/sso/cache/`** — the very same cache the `aws` CLI uses. brolly
-  adds no encryption of its own; it's a thin layer over the stock cache by design. For OS-keychain encryption
-  *today*, use aws-vault / granted / aws-sso-cli. Encrypted storage is the lead roadmap item below.
+- **Tokens live in the stock plaintext `~/.aws/sso/cache/` by default** — the very same cache the `aws` CLI uses.
+  That's the thin-by-design default. When you want tokens off disk, opt into
+  [secure mode](#secure-mode-os-keychain) (`brolly secure enable`), which stores them in your OS keychain and
+  vends credentials via `credential_process`.
 
 ## Roadmap
 
-1. **Keychain-backed token storage via a `credential_process` mode.** An opt-in mode where brolly does the
-   device auth itself, stores the SSO token in the OS keychain (via the Python
-   [`keyring`](https://github.com/jaraco/keyring) library), and registers itself as each profile's
-   `credential_process` — so credentials never sit in plaintext on disk and SDK consumers stay fully transparent
-   (just `AWS_PROFILE`, no shell wrapper). The prompt pill's freshness check would then read a small non-secret
-   expiry sidecar instead of the plaintext cache. On headless Linux with no OS keychain, `keyring` falls back to
-   an encrypted-file backend guarded by a passphrase. This mode makes brolly "take over credential resolution,"
-   which is exactly the trade the plaintext default avoids — so it stays **opt-in**, keeping brolly a thin stock-
-   cache layer by default.
-2. Test suite, CI, and publish to the `fduplex` PyPI org.
+- **Windows support.** The interactive picker uses `termios`/`tty` (POSIX only). A `msvcrt`-based key reader
+  would let the menus run natively on Windows.
+- **Passphrase-backend ergonomics for secure mode.** Smoother first-run setup for the headless-Linux encrypted-
+  file keyring backend.
+
+Shipped: [secure mode](#secure-mode-os-keychain) (opt-in OS-keychain token storage via `credential_process`),
+a test suite, CI, and publication to the `fduplex` PyPI org.
 
 ## License
 
