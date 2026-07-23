@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="brolly">
+  <title>brolly</title>
+  <!-- Mid-tone fills only, so the mark stays legible on light and dark backgrounds alike. -->
+  <g fill="none" stroke="#a35f3d" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M32 8V4"/>
+    <path d="M32 34v14a6 6 0 1 1-12 0"/>
+  </g>
+  <path fill="#d7875f" d="M6 34a26 26 0 0 1 52 0q-6.5 7-13 0-6.5 7-13 0-6.5 7-13 0-6.5 7-13 0z"/>
+</svg>
