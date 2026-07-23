@@ -51,12 +51,13 @@ _DIM = '\033[2m'
 _RESET = '\033[0m'
 
 # nerd-font glyphs (match the shell prompt's AWS pill)
-_AWS = ''  # amazon
-_ACCT = ''  # institution / account
-_ROLE = ''  # key / role
-_CURSOR = ''  # caret-right
-_CURRENT = ''  # check-circle
-_CHECK = ''  # check
+# Nerd Font glyphs as \u escapes (raw private-use bytes don't survive tooling); needs a Nerd Font to render.
+_AWS = '\ue7ad'  # nf-dev-aws
+_ACCT = '\uf19c'  # nf-fa-institution
+_ROLE = '\uf084'  # nf-fa-key
+_CURSOR = '\uf0da'  # nf-fa-caret-right
+_CURRENT = '\uf058'  # nf-fa-check-circle
+_CHECK = '\uf00c'  # nf-fa-check
 
 
 def _require_aws() -> None:
@@ -273,7 +274,25 @@ def _backfill_account_name(profile: ProfileName, sso_region: Region, account_id:
                 return
 
 
-def cmd_refresh(target_profile: ProfileName, session: SessionName, full_config: AwsConfig) -> None:
+def _is_secure(profile_config: AwsConfig) -> bool:
+    """True if the profile is in brolly secure mode — its account/role live under ``brolly_sso_*`` in the keychain."""
+    return 'brolly_sso_account_id' in profile_config
+
+
+def _secure_mode_tip(session_name: SessionName, full_config: AwsConfig) -> None:
+    """A dim, one-line nudge toward secure mode after a credential-establishing action — unless already secured."""
+    if any(_is_secure(c) for c in full_config['profiles'].values() if c.get('sso_session') == session_name):
+        return
+    print(
+        f"{_DIM}tip: 'brolly secure enable -s {session_name}' keeps this session's token in your OS keychain, "
+        f'not ~/.aws/sso/cache{_RESET}',
+        file=sys.stderr,
+    )
+
+
+def cmd_refresh(
+    target_profile: ProfileName, session: SessionName, full_config: AwsConfig, secure: bool = False
+) -> None:
     profiles = full_config['profiles']
     if target_profile not in profiles:
         raise SystemExit(f"unknown profile '{target_profile}' — available: {', '.join(sorted(profiles))}")
@@ -295,7 +314,12 @@ def cmd_refresh(target_profile: ProfileName, session: SessionName, full_config: 
     )
     if check.returncode != 0:
         print(f'{target_profile}: credentials unavailable — logging in…', file=sys.stderr)
-        _aws('sso', 'login', '--sso-session', actual, '--no-browser', '--use-device-code', capture=False)
+        if secure:
+            from brolly import keychain
+
+            keychain.cmd_secure_login(actual, full_config)
+        else:
+            _aws('sso', 'login', '--sso-session', actual, '--no-browser', '--use-device-code', capture=False)
         arn = _aws(
             'sts', 'get-caller-identity', '--profile', target_profile, '--query', 'Arn', '--output', 'text'
         ).stdout.strip()
@@ -307,7 +331,9 @@ def cmd_refresh(target_profile: ProfileName, session: SessionName, full_config: 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='brolly', description='authenticate, repoint, or create AWS SSO profiles')
-    sub = parser.add_subparsers(dest='cmd')
+    # metavar lists only the public commands; `credential-process` and `ps1` are machine-facing, so they are
+    # registered without help= (which keeps argparse from listing them) and left out of the metavar.
+    sub = parser.add_subparsers(dest='cmd', metavar='{login,switch,refresh,add,secure}')
 
     login = sub.add_parser('login', help='force a fresh device-code login for a session')
     login.add_argument('-s', '--session', help="sso-session to log into (default: current profile's)")
@@ -321,6 +347,25 @@ def _build_parser() -> argparse.ArgumentParser:
     add = sub.add_parser('add', help='create a new profile under an sso-session')
     add.add_argument('profile', help='new profile name')
     add.add_argument('-s', '--session', help="session to create it under (default: current profile's)")
+
+    secure = sub.add_parser('secure', help='opt-in OS-keychain token storage (credential_process mode)')
+    secure_sub = secure.add_subparsers(dest='secure_cmd', required=True)
+    for name, summary in (
+        ('enable', 'move a session into the OS keychain and rewrite its profiles as credential_process'),
+        ('disable', 'revert a session to the stock plaintext cache and purge its keychain token'),
+        ('login', 're-authorize a secured session, refreshing its keychain token'),
+    ):
+        sp = secure_sub.add_parser(name, help=summary)
+        sp.add_argument('-s', '--session', help="sso-session to operate on (default: current profile's)")
+        if name == 'enable':
+            sp.add_argument(
+                '--backend',
+                help='keyring backend dotted path to use and save (e.g. keyring_pass.PasswordStoreBackend); '
+                'default: auto-detect an OS keychain, or pass if its store is set up',
+            )
+
+    cred = sub.add_parser('credential-process')
+    cred.add_argument('--profile', required=True, help='the secured profile to vend credentials for')
 
     return parser
 
@@ -336,10 +381,19 @@ def _session_in_context(current: ProfileName, full_config: AwsConfig, override: 
 
 
 def main(argv: list[str]) -> None:
-    _require_aws()
-    current: ProfileName = os.environ.get('AWS_PROFILE', 'default')
     parser = _build_parser()
     args = parser.parse_args(argv or ['refresh'])
+
+    if args.cmd == 'credential-process':
+        # Machine-facing, invoked by the AWS SDK on every cold credential resolution: keep it lean — no aws CLI
+        # requirement, no full_config scan — and let it own stdout for the credential JSON.
+        from brolly import keychain
+
+        keychain.cmd_credential_process(args.profile)
+        return
+
+    _require_aws()
+    current: ProfileName = os.environ.get('AWS_PROFILE', 'default')
     full_config: AwsConfig = botocore.session.Session().full_config
     if args.cmd == 'login':
         session = _session_in_context(current, full_config, args.session)
@@ -348,13 +402,36 @@ def main(argv: list[str]) -> None:
                 f"unknown sso-session '{session}' — available: {', '.join(sorted(full_config['sso_sessions']))}"
             )
         cmd_login(session)
+        _secure_mode_tip(session, full_config)
     elif args.cmd == 'switch':
-        cmd_switch(current)
+        if _is_secure(full_config['profiles'].get(current, {})):
+            from brolly import keychain
+
+            keychain.cmd_secure_switch(current, full_config)
+        else:
+            cmd_switch(current)
     elif args.cmd == 'refresh':
         target = args.profile or current
-        cmd_refresh(target, _session_in_context(current, full_config, args.session), full_config)
+        secure = _is_secure(full_config['profiles'].get(target, {}))
+        cmd_refresh(target, _session_in_context(current, full_config, args.session), full_config, secure)
     elif args.cmd == 'add':
-        cmd_add(_session_in_context(current, full_config, args.session), args.profile, full_config)
+        session = _session_in_context(current, full_config, args.session)
+        cmd_add(session, args.profile, full_config)
+        _secure_mode_tip(session, full_config)
+    elif args.cmd == 'secure':
+        from brolly import keychain
+
+        session = _session_in_context(current, full_config, args.session)
+        if session not in full_config['sso_sessions']:
+            raise SystemExit(
+                f"unknown sso-session '{session}' — available: {', '.join(sorted(full_config['sso_sessions']))}"
+            )
+        if args.secure_cmd == 'enable':
+            keychain.cmd_secure_enable(session, full_config, args.backend)
+        elif args.secure_cmd == 'disable':
+            keychain.cmd_secure_disable(session, full_config)
+        else:
+            keychain.cmd_secure_login(session, full_config)
     else:
         parser.print_usage(sys.stderr)
         raise SystemExit(2)
