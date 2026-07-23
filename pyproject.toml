@@ -1,0 +1,61 @@
+[project]
+name = 'brolly'
+version = '0.1.0'
+description = 'A pure-Python CLI for AWS IAM Identity Center (SSO)'
+authors = [
+  { name = 'Full Duplex Media', email = 'contact@fullduplex.media' }
+]
+readme = 'README.md'
+requires-python = '>=3.14'
+license = { text = 'Apache-2.0' }
+keywords = ['aws', 'sso', 'iam-identity-center', 'cli', 'boto3', 'aws-profile']
+classifiers = [
+  'Development Status :: 4 - Beta',
+  'Environment :: Console',
+  'Intended Audience :: Developers',
+  'Intended Audience :: System Administrators',
+  'Operating System :: POSIX',
+  'Operating System :: MacOS',
+  'Programming Language :: Python :: 3',
+  'Programming Language :: Python :: 3 :: Only',
+  'Programming Language :: Python :: 3.14',
+  'Topic :: Utilities',
+  'Topic :: System :: Systems Administration :: Authentication/Directory'
+]
+dependencies = [
+  'boto3'
+]
+
+[dependency-groups]
+dev = [
+  'ruff',
+  'ty'
+]
+
+[project.scripts]
+brolly = 'brolly.cli:app'
+
+[project.urls]
+Homepage = 'https://github.com/fduplex/brolly'
+Repository = 'https://github.com/fduplex/brolly'
+Issues = 'https://github.com/fduplex/brolly/issues'
+
+[build-system]
+requires = ['uv_build>=0.11.0,<0.12.0']
+build-backend = 'uv_build'
+
+[tool.ruff]
+line-length = 120
+target-version = 'py314'
+
+[tool.ruff.lint]
+select = ['E', 'F', 'UP', 'B', 'SIM']
+ignore = ['SIM117']
+flake8-quotes = { inline-quotes = 'single', multiline-quotes = 'double' }
+pydocstyle = { convention = 'google' }
+
+[tool.ruff.format]
+preview = true
+quote-style = 'single'
+indent-style = 'space'
+docstring-code-format = true

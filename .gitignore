@@ -1,0 +1,38 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[codz]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# uv / virtualenvs
+.venv/
+venv/
+env/
+# uv.lock is committed — it pins the resolved dependency set.
+
+# Tooling caches
+.ruff_cache/
+.ty_cache/
+.mypy_cache/
+.pytest_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
