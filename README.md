@@ -2,6 +2,11 @@
 
 > *brolly* — British informal for umbrella. One login covers every profile under an AWS SSO session.
 
+[![PyPI version](https://img.shields.io/pypi/v/brolly)](https://pypi.org/project/brolly/)
+[![Python versions](https://img.shields.io/pypi/pyversions/brolly)](https://pypi.org/project/brolly/)
+[![CI](https://github.com/fduplex/brolly/actions/workflows/ci.yml/badge.svg)](https://github.com/fduplex/brolly/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](LICENSE)
+
 A small, pure-Python CLI for AWS IAM Identity Center (SSO): log in once per session, switch accounts and roles
 in place, and keep your profiles fresh — without ever touching `$AWS_PROFILE`.
 
