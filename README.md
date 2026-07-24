@@ -23,6 +23,7 @@ brolly login [-s <session>]             force a fresh device-code login for a se
 brolly switch                           repoint the current profile's account/role
 brolly refresh [<profile>] [-s <session>]
 brolly add <profile> [-s <session>]
+brolly ls [--no-check]                  list every sso-session and its profiles, with token status
 brolly secure enable|disable [-s <session>]   opt-in: keep a session's token in your OS keychain
 ```
 
@@ -122,6 +123,13 @@ $ brolly add customer-admin -s customer  # explicit session
 It does **not** change `$AWS_PROFILE`. If you Ctrl-C out of the picker the profile skeleton is already written, so
 finish it with `export AWS_PROFILE=<name>` then `brolly switch` rather than re-running `add`.
 
+### `brolly ls [--no-check]`
+
+Lists every `sso-session` and its profiles as one aligned table, with live/idle/gone token status, expiry, and a
+footer naming what `$AWS_PROFILE` currently resolves to — `ls -l` for brolly, where `ps1` is the glance. By default
+it silently probes each session over the network (an SSO refresh-token grant, never an interactive login) to tell a
+truly-dead session apart from a merely-lapsed token; `--no-check` skips that and reads local expiry files only.
+
 ### Common tasks
 
 | Situation | Command |
@@ -133,7 +141,32 @@ finish it with `export AWS_PROFILE=<name>` then `brolly switch` rather than re-r
 | New profile under a different session | `brolly add <name> -s customer` |
 | Refresh a profile in another session | `brolly refresh <profile> -s <session>` |
 | Interrupted a `brolly add` mid-picker | `export AWS_PROFILE=<name>` then `brolly switch` |
+| See every session/profile & token status | `brolly ls` (add `--no-check` to skip the network probe) |
 | Keep a session's token out of plaintext | `brolly secure enable -s <session>` |
+
+## Shell prompt integration
+
+`brolly ps1` renders a colored `AWS_PROFILE` pill reflecting the **local, filesystem-only** state of the session
+token — no network call, no keychain access, no boto3 import:
+
+- **live** (amber) — token still valid.
+- **idle** (grey, clock glyph) — cached but lapsed; refreshes automatically on next use.
+- **gone** (red, cross glyph) — no cached token; run `brolly`.
+- **plain** (neutral grey) — not an SSO profile.
+
+<p align="center">
+  <img src="assets/prompt-states.svg" width="720" alt="brolly ps1 prompt pill shown in its live, idle, gone, and plain states">
+</p>
+
+Add it to your `PS1`. It needs a **[Nerd Font](https://www.nerdfonts.com/)** for the separators and glyphs:
+
+```bash
+export PS1='$(brolly ps1)\u@\h:\w\$ '
+```
+
+It reads whichever store the profile actually uses — the expiry sidecar for secure-mode profiles, the stock cache
+otherwise — so it stays accurate with no configuration. A dead 7-day session can't be detected locally, so it
+reads as `idle` rather than `gone`. Cost is ~10ms per prompt.
 
 ## Secure mode (OS keychain)
 
@@ -210,26 +243,6 @@ gpg-agent must already be warm when `credential-process` runs, since it has no T
 a 1Password service-account token. `keyrings.alt`'s `EncryptedKeyring` is a last resort: with no daemon to keep it
 unlocked it prompts in *every* new process, meaning a prompt on roughly every `aws` call and a hard failure
 anywhere non-interactive.
-
-## Shell prompt integration
-
-`brolly ps1` renders a colored `AWS_PROFILE` pill reflecting the **local, filesystem-only** state of the session
-token — no network call, no keychain access, no boto3 import:
-
-- **live** (amber) — token still valid.
-- **idle** (grey, clock glyph) — cached but lapsed; refreshes automatically on next use.
-- **gone** (red, cross glyph) — no cached token; run `brolly`.
-- **plain** (neutral grey) — not an SSO profile.
-
-Add it to your `PS1`. It needs a **[Nerd Font](https://www.nerdfonts.com/)** for the separators and glyphs:
-
-```bash
-export PS1='$(brolly ps1)\u@\h:\w\$ '
-```
-
-It reads whichever store the profile actually uses — the expiry sidecar for secure-mode profiles, the stock cache
-otherwise — so it stays accurate with no configuration. A dead 7-day session can't be detected locally, so it
-reads as `idle` rather than `gone`. Cost is ~10ms per prompt.
 
 ## How it compares
 
