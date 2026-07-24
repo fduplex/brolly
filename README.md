@@ -10,7 +10,7 @@
   <a href="https://pypi.org/project/brolly/"><img src="https://img.shields.io/pypi/v/brolly" alt="PyPI version"></a>
   <a href="https://pypi.org/project/brolly/"><img src="https://img.shields.io/pypi/pyversions/brolly" alt="Python versions"></a>
   <a href="https://github.com/fduplex/brolly/actions/workflows/ci.yml"><img src="https://github.com/fduplex/brolly/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License"></a>
+  <a href="https://github.com/fduplex/brolly/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License"></a>
 </p>
 
 A small, pure-Python CLI for AWS IAM Identity Center (SSO). Authenticate once against an `[sso-session]` and every
@@ -81,7 +81,7 @@ one). Rewrites `sso_account_id`, `sso_role_name`, and `sso_account_name` in plac
 what lets the prompt show something friendlier than a raw ID.
 
 <p align="center">
-  <img src="assets/switch.svg" width="720" alt="brolly switch: an arrow-key picker choosing an account, then a role, then the confirmation line">
+  <img src="https://raw.githubusercontent.com/fduplex/brolly/main/assets/switch.svg" width="720" alt="brolly switch: an arrow-key picker choosing an account, then a role, then the confirmation line">
 </p>
 
 The circle marks where the profile points now, the highlighted row is the cursor. `$AWS_PROFILE` is untouched —
@@ -127,7 +127,7 @@ it silently probes each session over the network (an SSO refresh-token grant, ne
 truly-dead session apart from a merely-lapsed token; `--no-check` skips that and reads local expiry files only.
 
 <p align="center">
-  <img src="assets/ls-table.svg" width="900" alt="brolly ls output: two sso-sessions with their profiles, token status, accounts, roles and regions">
+  <img src="https://raw.githubusercontent.com/fduplex/brolly/main/assets/ls-table.svg" width="900" alt="brolly ls output: two sso-sessions with their profiles, token status, accounts, roles and regions">
 </p>
 
 The current profile is the orange one. `secure` marks which profiles keep their token in the OS keychain, and the
@@ -158,7 +158,7 @@ the session token — no network call, no keychain access, no boto3 import:
 - **plain** (neutral grey) — not an SSO profile.
 
 <p align="center">
-  <img src="assets/prompt-states.svg" width="800" alt="brolly ps1 prompt pill shown in its live, idle, gone, and plain states">
+  <img src="https://raw.githubusercontent.com/fduplex/brolly/main/assets/prompt-states.svg" width="800" alt="brolly ps1 prompt pill shown in its live, idle, gone, and plain states">
 </p>
 
 Add it to your `PS1`. It needs a **[Nerd Font](https://www.nerdfonts.com/)** for the separators and glyphs:
