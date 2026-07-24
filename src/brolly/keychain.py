@@ -43,6 +43,7 @@ from .cli import (
     _aws,
     _is_secure,
     _pick_account_role,
+    _session_profiles,
 )
 
 type TokenBlob = dict[str, Any]
@@ -419,10 +420,6 @@ def cmd_credential_process(profile: ProfileName) -> None:
             'Expiration': datetime.fromtimestamp(creds['expiration'] / 1000, tz=UTC).isoformat(),
         })
     )
-
-
-def _session_profiles(session_name: SessionName, full_config: AwsConfig) -> list[tuple[ProfileName, AwsConfig]]:
-    return [(p, c) for p, c in full_config['profiles'].items() if c.get('sso_session') == session_name]
 
 
 def cmd_secure_enable(session_name: SessionName, full_config: AwsConfig, backend: str | None = None) -> None:

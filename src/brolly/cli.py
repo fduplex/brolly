@@ -11,6 +11,10 @@ usage:
   brolly add <profile> [-s <session>]
                                      create a new profile under an existing sso-session, pick its account/role,
                                      and leave it authenticated
+  brolly ls [--no-check]             list every sso-session and its profiles, with token status; by default
+                                     silently probes each session over the network to distinguish a dead 7-day
+                                     session from a merely-lapsed hourly token — --no-check skips that and reads
+                                     local expiry files only
 
 Bare `brolly` no longer force-logs-in — it refreshes the current profile; use `brolly login` for a forced login.
 
@@ -24,18 +28,28 @@ creates a new profile without changing which one the shell uses, and `refresh` t
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import termios
 import tty
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import boto3
 import botocore.session
-from botocore.exceptions import SSOTokenLoadError, TokenRetrievalError, UnauthorizedSSOTokenError
+from botocore.exceptions import (
+    BotoCoreError,
+    SSOTokenLoadError,
+    TokenRetrievalError,
+    UnauthorizedSSOTokenError,
+)
 from botocore.tokens import create_token_resolver
+
+from .prompt import State, _aws_config_path, _expiry_path, _state_for
 
 type ProfileName = str
 type SessionName = str
@@ -55,9 +69,46 @@ _RESET = '\033[0m'
 _AWS = '\ue7ad'  # nf-dev-aws
 _ACCT = '\uf19c'  # nf-fa-institution
 _ROLE = '\uf084'  # nf-fa-key
+_LOCK = '\uf023'  # nf-fa-lock
+_GLOBE = '\uf0ac'  # nf-fa-globe
 _CURSOR = '\uf0da'  # nf-fa-caret-right
 _CURRENT = '\uf058'  # nf-fa-check-circle
 _CHECK = '\uf00c'  # nf-fa-check
+_CLOCK = '\uf017'  # nf-fa-clock_o
+_CROSS = '\uf00d'  # nf-fa-times
+_USER = '\uf007'  # nf-fa-user
+_PULSE = '\uf21e'  # nf-fa-heartbeat
+
+_GREEN = '\033[32m'
+_RED = '\033[31m'
+
+# `ls` status -> (colour, glyph); palette kept in step with the ps1 pill's live/idle/gone/plain states so the
+# two surfaces read as one tool.
+_STATUS_STYLES: dict[State, tuple[str, str]] = {
+    'live': (_GREEN, _CHECK),
+    'idle': (_ORANGE, _CLOCK),
+    'gone': (_RED, _CROSS),
+    'plain': (_DIM, '\u00b7'),
+}
+
+# `ls` profile-table columns: [profile, secure, account, role, region]. Every heading pairs the column's glyph with
+# its word (the profile column with a user glyph); attribute rows repeat that glyph, and the secure cell is the one
+# column carrying its own colour, so both the header and that cell are indexed off _SECURE_COL.
+_PROFILE_COL = 0
+_SECURE_COL = 1
+_HEADERS = [f'{_USER} profile', f'{_LOCK} secure', f'{_ACCT} account', f'{_ROLE} role', f'{_GLOBE} region']
+
+# The session line is column-aligned for its first two fields (`session` name, `status` indicator); the expiry
+# detail then runs on as a colspan from the `profile` column rightward. The `session` heading carries the _AWS glyph
+# over the session names, `status` a heartbeat glyph over the state indicators, and `profile` + the attribute
+# headings sit over the nested profile columns. Session rows no longer lead with the _AWS glyph — the name itself
+# now carries the orange, and the whole table hangs off a fixed left indent.
+_SESSION_HEADING = f'{_AWS} session'
+_STATUS_HEADING = f'{_PULSE} status'
+_SESSION_INDENT = 3  # left margin the whole table (headings, rule, session and profile rows) starts from
+# widest of `<glyph> <state word>` across every state, floored at the heading label — the status column never
+# depends on the data, so it is sized once here
+_STATUS_WIDTH = max(len(_STATUS_HEADING), *(len(f'{glyph} {state}') for state, (_, glyph) in _STATUS_STYLES.items()))
 
 
 def _require_aws() -> None:
@@ -329,11 +380,207 @@ def cmd_refresh(
     print(f'{_ORANGE}{_CHECK}{_RESET}  {target_profile} live → {arn}')
 
 
+def _session_profiles(session_name: SessionName, full_config: AwsConfig) -> list[tuple[ProfileName, AwsConfig]]:
+    return [(p, c) for p, c in full_config['profiles'].items() if c.get('sso_session') == session_name]
+
+
+def _color(text: str, colour: str, tty: bool) -> str:
+    return f'{colour}{text}{_RESET}' if tty else text
+
+
+def _read_expiry(path: Path) -> datetime | None:
+    try:
+        expiry = datetime.fromisoformat(json.loads(path.read_text())['expiresAt'])
+    except OSError, ValueError, KeyError:
+        return None
+    return expiry if expiry.tzinfo else expiry.replace(tzinfo=UTC)
+
+
+def _countdown(expiry: datetime) -> str:
+    total = int((expiry - datetime.now(UTC)).total_seconds())
+    sign, total = ('-', -total) if total < 0 else ('', total)
+    hours, minutes = total // 3600, (total % 3600) // 60
+    return f'{sign}{hours}h{minutes:02d}m' if hours else f'{sign}{minutes}m'
+
+
+def _status_detail(state: State, expiry: datetime | None) -> str:
+    """The expiry colspan only — the state word itself now lives in the `status` column, so it is not repeated here."""
+    if state == 'gone':
+        return 'no valid token'
+    if expiry is None:
+        return ''
+    verb = 'expires' if expiry > datetime.now(UTC) else 'expired'
+    return f'{verb} {expiry.astimezone():%Y-%m-%d %H:%M} ({_countdown(expiry)})'
+
+
+def _probe_session(
+    session_name: SessionName, profile: ProfileName, secure: bool, keychain_mod: Any, keyring_module: Any
+) -> tuple[State, datetime | None] | None:
+    """Silently probe a session's real liveness by asking botocore's SSO token machinery to refresh it.
+
+    The provider only ever uses the ``refresh_token`` grant against sso-oidc — it never runs device authorization —
+    so this can resolve the dead-session-vs-lapsed-token ambiguity without any risk of triggering interactive login.
+    Returns ``(state, expiry)`` when the endpoint answered, or ``None`` when it was unreachable (offline) so the
+    caller falls back to the local read.
+    """
+    try:
+        if secure:
+            if keyring_module is None:
+                return None
+            token = keychain_mod.load_secure_token(profile, session_name, keyring_module)
+            if token is None:
+                return 'gone', None
+            return 'live', _read_expiry(keychain_mod._sidecar_path(keychain_mod._cache_key(session_name)))
+        loaded = create_token_resolver(botocore.session.Session(profile=profile)).load_token()
+        if loaded is None:
+            return 'gone', None
+        return 'live', loaded.get_frozen_token().expiration
+    except SSOTokenLoadError, TokenRetrievalError, UnauthorizedSSOTokenError:
+        return 'gone', None
+    except BotoCoreError, OSError, SystemExit:
+        # offline, keychain unavailable, or any other probe failure — never crash ls; fall back to the local read
+        return None
+
+
+def _profile_cells(profile: ProfileName, cfg: AwsConfig, sso_region: Region) -> tuple[ProfileName, list[str], bool]:
+    """Raw (uncoloured) table cells for one profile row, plus whether it is secure — column order is _HEADERS."""
+    account_id = cfg.get('sso_account_id') or cfg.get('brolly_sso_account_id') or '?'
+    role = cfg.get('sso_role_name') or cfg.get('brolly_sso_role_name') or '?'
+    name = cfg.get('sso_account_name')
+    account = f'{account_id} ({name})' if name else account_id
+    region = cfg.get('region') or sso_region or '?'
+    secure = _is_secure(cfg)
+    return profile, [profile, _CHECK if secure else _CROSS, account, role, region], secure
+
+
+def _print_profiles(
+    rows: list[tuple[ProfileName, list[str], bool]],
+    current: ProfileName | None,
+    widths: list[int],
+    profile_col: int,
+    tty: bool,
+) -> None:
+    if not rows:
+        print(f'{" " * profile_col}{_color("(no profiles)", _DIM, tty)}')
+        return
+    for profile, cells, secure in rows:
+        parts: list[str] = []
+        for c, cell in enumerate(cells):
+            if c == _SECURE_COL:
+                # centre the lone glyph, padding on the raw width — ANSI codes must not count toward the column
+                colour = _GREEN if secure else _RED
+                pad = widths[c] - len(cell)
+                left = pad // 2
+                parts.append(' ' * left + _color(cell, colour, tty) + ' ' * (pad - left))
+            elif c == _PROFILE_COL and profile == current:
+                # the current profile's name carries the orange; pad on the raw name so ANSI never skews the column
+                parts.append(_color(cell, _ORANGE, tty) + ' ' * (widths[c] - len(cell)))
+            else:
+                parts.append(cell.ljust(widths[c]))
+        # names all start at profile_col; no per-row marker cell — the current row is flagged by its orange name
+        print(f'{" " * profile_col}{"  ".join(parts)}')
+
+
+def _print_ls_footer(
+    current: ProfileName | None,
+    blocks: list[tuple[SessionName, State, datetime | None, list[tuple[ProfileName, list[str], bool]]]],
+    full_config: AwsConfig,
+    tty: bool,
+) -> None:
+    """One line naming what $AWS_PROFILE resolves to, reusing the rows already resolved for the table above."""
+    indent = ' ' * _SESSION_INDENT
+    if current is None:
+        hint = '(export AWS_PROFILE=<profile> to pick one)'
+        print(f'{indent}{_color("AWS_PROFILE not set", _DIM, tty)}  {_color(hint, _DIM, tty)}')
+        return
+    found = next(((st, cells) for _, st, _, rows in blocks for prof, cells, _ in rows if prof == current), None)
+    if found is None:
+        # set to a profile the table doesn't list: either absent from config, or present but non-SSO (ls lists
+        # sso-sessions only) — no session state to show either way, so warn rather than fabricate a status
+        note = (
+            '(not an SSO profile — brolly ls lists sso-sessions only)'
+            if current in full_config['profiles']
+            else '(no such profile in ~/.aws/config)'
+        )
+        print(f'{indent}{_color(f"AWS_PROFILE → {current}", _RED, tty)}  {_color(note, _DIM, tty)}')
+        return
+    state, cells = found
+    colour, glyph = _STATUS_STYLES[state]
+    status = _color(f'{glyph} {state}', colour, tty)
+    detail = f'{cells[2]} / {cells[3]}  {cells[4]}'  # account (id + name) / role  region — already resolved above
+    lead = _color(_CURRENT, _ORANGE, tty)
+    print(f'{indent}{lead}  AWS_PROFILE → {_color(current, _ORANGE, tty)}  {status}  {detail}')
+
+
+def cmd_ls(full_config: AwsConfig, current: ProfileName | None, check: bool) -> None:
+    sso_sessions = full_config['sso_sessions']
+    if not sso_sessions:
+        raise SystemExit('no sso-sessions configured — create one with `aws configure sso`')
+    tty = sys.stdout.isatty()
+    config = _aws_config_path()
+
+    keychain_mod = keyring_module = None
+    if check and any(_is_secure(c) for c in full_config['profiles'].values()):
+        try:
+            from brolly import keychain
+
+            keychain_mod, keyring_module = keychain, keychain._configured_keyring()
+        except Exception, SystemExit:
+            keychain_mod = keyring_module = None
+
+    # First pass: resolve every session's status and its profile rows so the profile columns can be sized once
+    # across all sessions — the table stays aligned across session breaks instead of per-session.
+    blocks: list[tuple[SessionName, State, datetime | None, list[tuple[ProfileName, list[str], bool]]]] = []
+    for session_name in sorted(sso_sessions):
+        members = _session_profiles(session_name, full_config)
+        secure = any(_is_secure(c) for _, c in members)
+        sso_region: Region = sso_sessions[session_name].get('sso_region', '')
+        path = _expiry_path(session_name, config, secure)
+        state, expiry = _state_for(path), _read_expiry(path)
+        if check and state == 'idle' and members:
+            probed = _probe_session(session_name, members[0][0], secure, keychain_mod, keyring_module)
+            if probed is not None:
+                state, expiry = probed
+        rows = [_profile_cells(p, c, sso_region) for p, c in sorted(members)]
+        blocks.append((session_name, state, expiry, rows))
+
+    all_rows = [cells for _, _, _, rows in blocks for _, cells, _ in rows]
+    # each column is sized to the wider of its widest data cell and its heading label (glyph+word can be widest)
+    data_widths = (max((len(cells[c]) for cells in all_rows), default=0) for c in range(len(_HEADERS)))
+    widths = [max(w, len(_HEADERS[c])) for c, w in enumerate(data_widths)]
+    session_width = max(len(_SESSION_HEADING), *(len(name) for name, *_ in blocks))
+    # the profile column sits right of the two session-line fields (session name, status), each with a 2-space gap
+    profile_col = _SESSION_INDENT + session_width + 2 + _STATUS_WIDTH + 2
+
+    print()  # leading blank line — separates the table from the shell prompt
+    heads: list[str] = [_SESSION_HEADING.center(session_width), _STATUS_HEADING.center(_STATUS_WIDTH)]
+    heads += [label.center(widths[c]) for c, label in enumerate(_HEADERS)]
+    head_line = '  '.join(heads)
+    print(_color(f'{" " * _SESSION_INDENT}{head_line}', _DIM, tty))  # every heading centred over its column
+    # a dim rule spans the table, from the left indent to the region column's right edge (the header line's width)
+    print(_color(f'{" " * _SESSION_INDENT}{"─" * len(head_line)}', _DIM, tty))
+    for session_name, state, expiry, rows in blocks:
+        colour, glyph = _STATUS_STYLES[state]
+        status_raw = f'{glyph} {state}'
+        # name/status cells padded on raw length (ANSI excluded); the expiry detail is a colspan from profile_col
+        name_cell = _color(session_name, _ORANGE, tty) + ' ' * (session_width - len(session_name))
+        status_cell = _color(status_raw, colour, tty) + ' ' * (_STATUS_WIDTH - len(status_raw))
+        detail = _status_detail(state, expiry)
+        line = f'{" " * _SESSION_INDENT}{name_cell}  {status_cell}'
+        if detail:
+            line += f'  {_color(detail, colour, tty)}'
+        print(line)
+        _print_profiles(rows, current, widths, profile_col, tty)
+        print()  # blank row after each session group, including the last
+    _print_ls_footer(current, blocks, full_config, tty)
+    print()  # one final blank line so the footer breathes before the shell prompt returns
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='brolly', description='authenticate, repoint, or create AWS SSO profiles')
     # metavar lists only the public commands; `credential-process` and `ps1` are machine-facing, so they are
     # registered without help= (which keeps argparse from listing them) and left out of the metavar.
-    sub = parser.add_subparsers(dest='cmd', metavar='{login,switch,refresh,add,secure}')
+    sub = parser.add_subparsers(dest='cmd', metavar='{login,switch,refresh,add,ls,secure}')
 
     login = sub.add_parser('login', help='force a fresh device-code login for a session')
     login.add_argument('-s', '--session', help="sso-session to log into (default: current profile's)")
@@ -347,6 +594,18 @@ def _build_parser() -> argparse.ArgumentParser:
     add = sub.add_parser('add', help='create a new profile under an sso-session')
     add.add_argument('profile', help='new profile name')
     add.add_argument('-s', '--session', help="session to create it under (default: current profile's)")
+
+    ls = sub.add_parser('ls', help='list sso-sessions and their profiles with token status')
+    ls.add_argument(
+        '--check',
+        dest='check',
+        action='store_true',
+        default=True,
+        help='silently probe each session for real liveness over the network (default)',
+    )
+    ls.add_argument(
+        '--no-check', dest='check', action='store_false', help='skip the network probe; classify from local cache only'
+    )
 
     secure = sub.add_parser('secure', help='opt-in OS-keychain token storage (credential_process mode)')
     secure_sub = secure.add_subparsers(dest='secure_cmd', required=True)
@@ -418,6 +677,9 @@ def main(argv: list[str]) -> None:
         session = _session_in_context(current, full_config, args.session)
         cmd_add(session, args.profile, full_config)
         _secure_mode_tip(session, full_config)
+    elif args.cmd == 'ls':
+        # ls distinguishes "unset" from "set to 'default'" for its footer, so pass the raw env (None when unset)
+        cmd_ls(full_config, os.environ.get('AWS_PROFILE'), args.check)
     elif args.cmd == 'secure':
         from brolly import keychain
 
