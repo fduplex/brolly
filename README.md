@@ -80,16 +80,12 @@ picker (`↑`/`↓` or `j`/`k`, `enter` to select, `q` to quit); accounts first,
 one). Rewrites `sso_account_id`, `sso_role_name`, and `sso_account_name` in place — recording the account name is
 what lets the prompt show something friendlier than a raw ID.
 
-```console
-$ export AWS_PROFILE=corp-prod
-$ brolly switch
-  select account   ↑/↓ move · enter select · q quit
-      ACCOUNT       NAME
-      111111111111  corp-prod       ← current
-    ▶ 222222222222  corp-staging
+<p align="center">
+  <img src="assets/switch.svg" width="720" alt="brolly switch: an arrow-key picker choosing an account, then a role, then the confirmation line">
+</p>
 
-✔  corp-prod → 222222222222 (corp-staging) / AdministratorAccess
-```
+The circle marks where the profile points now, the highlighted row is the cursor. `$AWS_PROFILE` is untouched —
+only what it resolves to changed, which the next prompt shows.
 
 ### `brolly refresh [<profile>] [-s <session>]`
 
@@ -130,6 +126,13 @@ footer naming what `$AWS_PROFILE` currently resolves to — `ls -l` for brolly, 
 it silently probes each session over the network (an SSO refresh-token grant, never an interactive login) to tell a
 truly-dead session apart from a merely-lapsed token; `--no-check` skips that and reads local expiry files only.
 
+<p align="center">
+  <img src="assets/ls-table.svg" width="900" alt="brolly ls output: two sso-sessions with their profiles, token status, accounts, roles and regions">
+</p>
+
+The current profile is the orange one. `secure` marks which profiles keep their token in the OS keychain, and the
+whole table needs a **[Nerd Font](https://www.nerdfonts.com/)** for its glyphs, same as the prompt pill.
+
 ### Common tasks
 
 | Situation | Command |
@@ -146,8 +149,8 @@ truly-dead session apart from a merely-lapsed token; `--no-check` skips that and
 
 ## Shell prompt integration
 
-`brolly ps1` renders a colored `AWS_PROFILE` pill reflecting the **local, filesystem-only** state of the session
-token — no network call, no keychain access, no boto3 import:
+`brolly ps1` renders a colored `session/profile · account` pill reflecting the **local, filesystem-only** state of
+the session token — no network call, no keychain access, no boto3 import:
 
 - **live** (amber) — token still valid.
 - **idle** (grey, clock glyph) — cached but lapsed; refreshes automatically on next use.
@@ -155,7 +158,7 @@ token — no network call, no keychain access, no boto3 import:
 - **plain** (neutral grey) — not an SSO profile.
 
 <p align="center">
-  <img src="assets/prompt-states.svg" width="720" alt="brolly ps1 prompt pill shown in its live, idle, gone, and plain states">
+  <img src="assets/prompt-states.svg" width="800" alt="brolly ps1 prompt pill shown in its live, idle, gone, and plain states">
 </p>
 
 Add it to your `PS1`. It needs a **[Nerd Font](https://www.nerdfonts.com/)** for the separators and glyphs:

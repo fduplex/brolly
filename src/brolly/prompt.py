@@ -97,11 +97,12 @@ def _state_for(path: Path) -> State:
     return 'live' if expiry > datetime.now(UTC) else 'idle'
 
 
-def _render(profile: str, account: str | None, state: State) -> str:
+def _render(profile: str, session: str | None, account: str | None, state: State) -> str:
     """The powerline pill. \\001/\\002 wrap non-printing bytes so readline computes the prompt width correctly."""
     background, foreground, glyph = _STYLES[state]
     start, end, esc = '\001', '\002', '\033'
-    label = f'{profile} · {account}' if account else profile
+    handle = f'{session}/{profile}' if session else profile
+    label = f'{handle} · {account}' if account else handle
     return (
         f'{start}{esc}[48;5;{_SHOULDER};38;5;{_LOGO};1m{end} {_AWS} '
         f'{start}{esc}[38;5;{_SHOULDER};48;5;{background}m{end}{_POWERLINE}'
@@ -120,5 +121,5 @@ def main() -> int:
     config = _aws_config_path()
     session, account, secure = _read_profile(profile, config)
     state: State = 'plain' if not session else _state_for(_expiry_path(session, config, secure))
-    sys.stdout.write(_render(profile, account, state))
+    sys.stdout.write(_render(profile, session, account, state))
     return 0
