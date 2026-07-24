@@ -125,57 +125,10 @@ finish it with `export AWS_PROFILE=<name>` then `brolly switch` rather than re-r
 
 ### `brolly ls [--no-check]`
 
-Lists every `[sso-session]` with its profiles grouped underneath — think `ls -l` for brolly, where `ps1` is the
-glance and `ls` is the full detail view. It renders as **one contiguous table** — every column is aligned across
-the session breaks, under a **header row whose labels are each a Nerd Font glyph + word, centred over their
-column**, with a **dim rule** beneath it. Every heading is glyphed: ☁ `session`, 💓 `status`, 👤 `profile`,
-🔒 `secure`, 🏛 `account`, 🔑 `role`, 🌐 `region`. The session line is column-aligned for its first two fields: a
-`session` column over the session names (shown in orange), then a `status` column holding the coloured state
-indicator (`✔ live`, 🕐 `idle`, ✗ `gone`); its expiry detail then runs on from the `profile` column rightward.
-Each session shows its token status with **both** an absolute expiry and a relative countdown; each profile shows a
-secure marker (a green ✔ when its token lives in your OS keychain, a red ✗ for the stock plaintext cache), account
-(id + name), role, and region. Whichever profile matches `$AWS_PROFILE` has its **name shown in orange** — there is
-no separate marker column. A **footer line** below the table then spells out what `$AWS_PROFILE` currently resolves
-to, naming the same profile in orange so the visual link is obvious.
-
-```console
-$ brolly ls
-
-   ☁ session 💓 status   👤 profile    🔒 secure  🏛 account                      🔑 role      🌐 region
-   ─────────────────────────────────────────────────────────────────────────────────────────────────
-   corp      ✔ live     expires 2026-07-24 16:39 (3h10m)
-                        corp-dev         ✗       333333333333 (corp-dev)         PowerUser    us-east-1
-                        corp-prod        ✗       222222222222 (corp-production)  AdminAccess  us-east-1
-
-   lab       🕐 idle    expired 2026-07-24 12:22 (-1h06m)
-                        lab-sandbox      ✔       444444444444 (lab-sandbox)      Developer    eu-west-1
-
-   ✅ AWS_PROFILE → corp-prod  ✔ live  222222222222 (corp-production) / AdminAccess  us-east-1
-```
-
-(the leading blank line separates the table from your prompt, a dim rule underlines the header, and a blank row
-closes each session group — the last one included. The current profile's **name is orange** (here `corp-prod`);
-Session names also carry the orange (the AWS glyph moved into the `session` heading, so rows no longer lead with
-it); the `status` word sits in its own column and the expiry detail spills over the columns to its right; the
-secure ✔/✗ is centred in its column. In your terminal the heading and attribute glyphs render via your Nerd Font.)
-
-The last line is a **footer** naming what `$AWS_PROFILE` resolves to, reusing the row already resolved above:
-`✅ AWS_PROFILE → <profile>` in orange, its live/idle/gone status, then `account (name) / role  region`. If
-`$AWS_PROFILE` is set to something not in `~/.aws/config` it reads `AWS_PROFILE → <name>  (no such profile in
-~/.aws/config)`; if it is unset it reads `AWS_PROFILE not set  (export AWS_PROFILE=<profile> to pick one)`. This
-deliberately duplicates the [`ps1` pill](#shell-prompt-integration) — the pill is the always-on glance, the footer
-is the same answer restated inside the full `ls` view — and that overlap is fine.
-
-States mirror the `ps1` pill so the two read as one tool: **live**, **idle**, **gone** (no valid token). `ls` only
-ever lists configured sso-sessions, so the pill's fourth state, **plain** (non-SSO), never shows up here — a
-profile's storage is shown separately by the secure column's ✔ (OS keychain) or ✗ (plaintext cache), under the
-🔒 `secure` heading.
-
-By default `ls` silently probes each session over the network — an SSO refresh-token grant, never an interactive
-login — so it can tell a truly-dead 7-day session (`gone`) from a merely-lapsed hourly token (`idle`), which the
-local cache alone can't distinguish. That probe can refresh/rewrite the cached token as a side effect, so plain
-`brolly ls` is **not** purely read-only. `brolly ls --no-check` skips the network entirely and classifies from the
-local expiry files only — fast and read-only, but a dead session may still read as `idle`.
+Lists every `sso-session` and its profiles as one aligned table, with live/idle/gone token status, expiry, and a
+footer naming what `$AWS_PROFILE` currently resolves to — `ls -l` for brolly, where `ps1` is the glance. By default
+it silently probes each session over the network (an SSO refresh-token grant, never an interactive login) to tell a
+truly-dead session apart from a merely-lapsed token; `--no-check` skips that and reads local expiry files only.
 
 ### Common tasks
 
