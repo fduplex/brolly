@@ -2,12 +2,16 @@
 """Generate assets/prompt-states.svg — a self-contained illustration of the `brolly ps1` prompt pill.
 
 The real pill is drawn with Nerd Font glyphs (powerline dividers, an AWS mark, clock/cross icons) and
-xterm-256 colours. A README reader has none of that font, so this renders every separator and glyph as a
-vector shape and hard-codes the 256-colour palette to true-colour hex. The output therefore looks identical
-in any SVG viewer — GitHub included — with no font dependency.
+xterm-256 colours. A README reader has none of that font, so this inlines the icons' true outlines, lifted
+from the font into nerd-glyphs.json by extract_glyphs.py, and hard-codes the 256-colour palette to true-colour
+hex. The dividers stay hand-drawn triangles — same shape as U+E0B0, but sized to the pill so the seams close.
+The output therefore looks identical in any SVG viewer — GitHub included — with no font dependency.
 
 Run `python assets/gen_prompt_states.py` after touching palette or copy; commit the regenerated .svg.
 """
+
+import json
+from pathlib import Path
 
 # xterm-256 -> hex, matching src/brolly/prompt.py exactly.
 SHOULDER = '#444444'  # 238
@@ -44,33 +48,26 @@ TOP = TITLE_H + 20
 TAIL = 'alex@lab:~/src$'
 
 
+_GLYPHS = json.loads((Path(__file__).parent / 'nerd-glyphs.json').read_text())['glyphs']
+
+# Cap height each glyph is drawn at, tuned so the trio reads at one optical weight next to 15px text.
+GLYPH_H = {'aws': 12.0, 'clock': 12.0, 'cross': 11.0}
+
+
 def esc(s: str) -> str:
     return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
-def aws_mark(cx: float, cy: float) -> str:
-    """The AWS 'smile' swoosh + arrowhead, near-white, centred on (cx, cy). ~18px wide."""
+def nf_glyph(name: str, cx: float, cy: float, color: str) -> str:
+    """Place a Nerd Font outline centred on (cx, cy). Font space is y-up, so the transform flips it."""
+    g = _GLYPHS[name]
+    x0, y0, x1, y1 = g['bounds']
+    scale = GLYPH_H[name] / (y1 - y0)
+    tx = cx - scale * (x0 + x1) / 2
+    ty = cy + scale * (y0 + y1) / 2
     return (
-        f'<g transform="translate({cx - 9},{cy - 5})" fill="none" stroke="{LOGO}" '
-        f'stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">'
-        f'<path d="M0 2 Q9 9 17 3"/>'
-        f'<path d="M13 1.4 L17.3 2.7 L15.4 6.6" fill="{LOGO}" stroke="none"/>'
-        f'</g>'
-    )
-
-
-def clock(cx: float, cy: float, color: str) -> str:
-    return (
-        f'<g transform="translate({cx},{cy})" fill="none" stroke="{color}" '
-        f'stroke-width="1.5" stroke-linecap="round">'
-        f'<circle r="5.4"/><path d="M0 -3 V0 L2.6 1.8"/></g>'
-    )
-
-
-def cross(cx: float, cy: float, color: str) -> str:
-    return (
-        f'<g transform="translate({cx},{cy})" stroke="{color}" stroke-width="1.9" stroke-linecap="round">'
-        f'<path d="M-4 -4 L4 4"/><path d="M4 -4 L-4 4"/></g>'
+        f'<g transform="translate({tx:.2f},{ty:.2f}) scale({scale:.5f},{-scale:.5f})" fill="{color}">'
+        f'<path d="{g["d"]}"/></g>'
     )
 
 
@@ -83,7 +80,7 @@ def pill(x: float, top: float, name: str, bg: str, fg: str, glyph: str | None, l
 
     # 1. shoulder segment + AWS mark
     parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{WS}" height="{ph}" fill="{SHOULDER}"/>')
-    parts.append(aws_mark(x + WS / 2, mid))
+    parts.append(nf_glyph('aws', x + WS / 2, mid, LOGO))
     sx = x + WS  # shoulder right edge
 
     # width of the state text region
@@ -98,11 +95,8 @@ def pill(x: float, top: float, name: str, bg: str, fg: str, glyph: str | None, l
 
     # 4. glyph + label
     tx = sx + T + PAD
-    if glyph == 'clock':
-        parts.append(clock(tx + 6, mid, fg))
-        tx += glyph_w
-    elif glyph == 'cross':
-        parts.append(cross(tx + 6, mid, fg))
+    if glyph:
+        parts.append(nf_glyph(glyph, tx + 6, mid, fg))
         tx += glyph_w
     parts.append(
         f'<text x="{tx:.1f}" y="{mid:.1f}" font-family="{FONT}" font-size="{FS}" font-weight="700" '
