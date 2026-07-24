@@ -1,7 +1,7 @@
 {
   "_source": "SymbolsNerdFont-Regular.ttf (Nerd Fonts symbols-only release)",
   "_license": "dev-aws: Devicons, MIT. fa-*: Font Awesome Free, icons CC BY 4.0.",
-  "_regenerate": "uv run --with fonttools python assets/extract_glyphs.py <SymbolsNerdFont-Regular.ttf>",
+  "_regenerate": "uv run python assets/extract_glyphs.py <SymbolsNerdFont-Regular.ttf>",
   "units_per_em": 2048,
   "glyphs": {
     "aws": {

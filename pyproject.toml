@@ -30,6 +30,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+  'fonttools>=4',  # assets/extract_glyphs.py only — see AGENTS.md
   'pytest>=8',
   'ruff',
   'ty'

@@ -5,11 +5,11 @@
 has no such font installed, so the glyphs ship as vector paths rather than text: this script pulls the real
 outlines out of the font once, and gen_prompt_states.py bakes them into the .svg.
 
-Run it only when the glyph set changes:
+Run it only when the glyph set changes (fontTools is in the dev dependency group):
 
     curl -sLo /tmp/nf.zip https://github.com/ryanoasis/nerd-fonts/releases/latest/download/NerdFontsSymbolsOnly.zip
     unzip -o /tmp/nf.zip -d /tmp/nf
-    uv run --with fonttools python assets/extract_glyphs.py /tmp/nf/SymbolsNerdFont-Regular.ttf
+    uv run python assets/extract_glyphs.py /tmp/nf/SymbolsNerdFont-Regular.ttf
 
 Upstream glyph sources, via Nerd Fonts: dev-aws from Devicons (MIT), fa-clock_o / fa-xmark from Font Awesome
 Free (icons CC BY 4.0), pl-left_hard_divider from Powerline (MIT).
@@ -56,7 +56,7 @@ def main(font_path: str) -> int:
     payload = {
         '_source': f'{Path(font_path).name} (Nerd Fonts symbols-only release)',
         '_license': 'dev-aws: Devicons, MIT. fa-*: Font Awesome Free, icons CC BY 4.0.',
-        '_regenerate': 'uv run --with fonttools python assets/extract_glyphs.py <SymbolsNerdFont-Regular.ttf>',
+        '_regenerate': 'uv run python assets/extract_glyphs.py <SymbolsNerdFont-Regular.ttf>',
         'units_per_em': font['head'].unitsPerEm,
         'glyphs': out,
     }
