@@ -17,9 +17,9 @@ ALERT = '#d75f5f'  # 167 (muted red)
 
 # state -> (bg, fg, glyph)  where glyph is 'clock' | 'cross' | None
 STATES = [
-    ('live', ACCENT, '#303030', None, 'corp-dev · dev', 'token still valid — nothing to do'),
-    ('idle', '#585858', ACCENT, 'clock', 'corp-prod · prod', 'lapsed — refreshes on next use'),
-    ('gone', ALERT, '#ffffff', 'cross', 'customer-admin · customer', 'no token — run brolly'),
+    ('live', ACCENT, '#303030', None, 'corp/corp-dev · Development Account', 'token still valid — nothing to do'),
+    ('idle', '#585858', ACCENT, 'clock', 'corp/corp-dev · Development Account', 'lapsed — refreshes on next use'),
+    ('gone', ALERT, '#ffffff', 'cross', 'corp/corp-dev · Development Account', 'no token — run brolly'),
     ('plain', SHOULDER, '#bcbcbc', None, 'legacy-keys', 'not an SSO profile'),
 ]
 

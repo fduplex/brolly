@@ -146,8 +146,8 @@ truly-dead session apart from a merely-lapsed token; `--no-check` skips that and
 
 ## Shell prompt integration
 
-`brolly ps1` renders a colored `AWS_PROFILE` pill reflecting the **local, filesystem-only** state of the session
-token — no network call, no keychain access, no boto3 import:
+`brolly ps1` renders a colored `session/profile · account` pill reflecting the **local, filesystem-only** state of
+the session token — no network call, no keychain access, no boto3 import:
 
 - **live** (amber) — token still valid.
 - **idle** (grey, clock glyph) — cached but lapsed; refreshes automatically on next use.
@@ -155,7 +155,7 @@ token — no network call, no keychain access, no boto3 import:
 - **plain** (neutral grey) — not an SSO profile.
 
 <p align="center">
-  <img src="assets/prompt-states.svg" width="720" alt="brolly ps1 prompt pill shown in its live, idle, gone, and plain states">
+  <img src="assets/prompt-states.svg" width="800" alt="brolly ps1 prompt pill shown in its live, idle, gone, and plain states">
 </p>
 
 Add it to your `PS1`. It needs a **[Nerd Font](https://www.nerdfonts.com/)** for the separators and glyphs:

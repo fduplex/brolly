@@ -57,7 +57,7 @@ def test_secure_profile_live_reads_sidecar(env, capsys):
     _expiry_file(env / 'brolly' / f'{key}.json', hours=8)
     out = _run(capsys)
     assert f'48;5;{prompt._ACCENT}' in out  # live accent
-    assert 'corp-prod · corp-prod' in out
+    assert 'corp/corp-prod · corp-prod' in out
     assert prompt._AWS in out and prompt._POWERLINE in out
 
 
@@ -90,6 +90,7 @@ def test_non_sso_profile_is_plain(env, capsys):
     out = _run(capsys)
     assert f'48;5;{prompt._SHOULDER}' in out  # plain grey
     assert _PROFILE in out
+    assert '/' not in out  # no session to prefix
 
 
 def test_account_falls_back_to_id_when_unnamed(env, capsys):
