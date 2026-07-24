@@ -23,11 +23,19 @@ from fontTools.pens.boundsPen import BoundsPen
 from fontTools.pens.svgPathPen import SVGPathPen
 from fontTools.ttLib import TTFont
 
-# The same codepoints src/brolly/prompt.py writes to the terminal.
+# The same codepoints src/brolly/prompt.py and the `ls` table in src/brolly/cli.py write to the terminal.
 WANTED = {
     'aws': 0xE7AD,  # nf-dev-aws
     'clock': 0xF017,  # nf-fa-clock_o
     'cross': 0xF00D,  # nf-fa-times
+    'check': 0xF00C,  # nf-fa-check
+    'check_circle': 0xF058,  # nf-fa-check-circle
+    'user': 0xF007,  # nf-fa-user
+    'lock': 0xF023,  # nf-fa-lock
+    'account': 0xF19C,  # nf-fa-institution
+    'role': 0xF084,  # nf-fa-key
+    'globe': 0xF0AC,  # nf-fa-globe
+    'pulse': 0xF21E,  # nf-fa-heartbeat
 }
 
 _OUT = Path(__file__).parent / 'nerd-glyphs.json'

@@ -130,6 +130,13 @@ footer naming what `$AWS_PROFILE` currently resolves to — `ls -l` for brolly, 
 it silently probes each session over the network (an SSO refresh-token grant, never an interactive login) to tell a
 truly-dead session apart from a merely-lapsed token; `--no-check` skips that and reads local expiry files only.
 
+<p align="center">
+  <img src="assets/ls-table.svg" width="900" alt="brolly ls output: two sso-sessions with their profiles, token status, accounts, roles and regions">
+</p>
+
+The current profile is the orange one. `secure` marks which profiles keep their token in the OS keychain, and the
+whole table needs a **[Nerd Font](https://www.nerdfonts.com/)** for its glyphs, same as the prompt pill.
+
 ### Common tasks
 
 | Situation | Command |

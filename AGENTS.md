@@ -18,19 +18,23 @@ uv run pytest
 It renders on every shell prompt, so it stays **stdlib-only** — no boto3, no keyring, no network, no subprocess.
 `tests/test_prompt.py` enforces the boto3 half of that; the rest is on you.
 
-## Regenerating the README illustration
+## Regenerating the README illustrations
 
-`assets/prompt-states.svg` is generated, never hand-edited. After changing the pill's palette, copy, or layout:
+Both `.svg`s under `assets/` are generated, never hand-edited. Shared drawing primitives live in `termsvg.py`.
 
 ```bash
-uv run python assets/gen_prompt_states.py   # rewrites assets/prompt-states.svg — commit it
+uv run python assets/gen_prompt_states.py   # -> assets/prompt-states.svg (the ps1 pill's four states)
+uv run python assets/gen_ls_table.py        # -> assets/ls-table.svg     (a `brolly ls` run)
 ```
 
-Keep its colours in sync with `_STYLES` in `src/brolly/prompt.py`, and its labels in the same shape the pill
-actually prints (`session/profile · account`).
+`gen_ls_table.py` calls the real `cmd_ls` against a synthetic config and paints the ANSI it emits, so the table
+can't drift — but re-run it after touching `ls`. It pins `now` and `TZ=UTC` so the committed SVG is
+reproducible; leave those alone. `gen_prompt_states.py` does draw its own copy, so keep its colours in step with
+`_STYLES` in `src/brolly/prompt.py` and its labels in the shape the pill really prints (`session/profile ·
+account`).
 
-The pill's icons are real Nerd Font outlines, baked into `assets/nerd-glyphs.json` so README readers need no
-font. That file is already committed — only re-extract when the glyph set in `prompt.py` changes:
+The icons in both are real Nerd Font outlines, baked into `assets/nerd-glyphs.json` so README readers need no
+font. That file is already committed — only re-extract when the glyph set in `prompt.py` or `cli.py` changes:
 
 ```bash
 curl -sLo /tmp/nf.zip https://github.com/ryanoasis/nerd-fonts/releases/latest/download/NerdFontsSymbolsOnly.zip
