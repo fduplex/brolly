@@ -135,6 +135,30 @@ finish it with `export AWS_PROFILE=<name>` then `brolly switch` rather than re-r
 | Interrupted a `brolly add` mid-picker | `export AWS_PROFILE=<name>` then `brolly switch` |
 | Keep a session's token out of plaintext | `brolly secure enable -s <session>` |
 
+## Shell prompt integration
+
+`brolly ps1` renders a colored `AWS_PROFILE` pill reflecting the **local, filesystem-only** state of the session
+token — no network call, no keychain access, no boto3 import:
+
+- **live** (amber) — token still valid.
+- **idle** (grey, clock glyph) — cached but lapsed; refreshes automatically on next use.
+- **gone** (red, cross glyph) — no cached token; run `brolly`.
+- **plain** (neutral grey) — not an SSO profile.
+
+<p align="center">
+  <img src="assets/prompt-states.svg" width="720" alt="brolly ps1 prompt pill shown in its live, idle, gone, and plain states">
+</p>
+
+Add it to your `PS1`. It needs a **[Nerd Font](https://www.nerdfonts.com/)** for the separators and glyphs:
+
+```bash
+export PS1='$(brolly ps1)\u@\h:\w\$ '
+```
+
+It reads whichever store the profile actually uses — the expiry sidecar for secure-mode profiles, the stock cache
+otherwise — so it stays accurate with no configuration. A dead 7-day session can't be detected locally, so it
+reads as `idle` rather than `gone`. Cost is ~10ms per prompt.
+
 ## Secure mode (OS keychain)
 
 By default brolly is a thin layer over the stock plaintext `~/.aws/sso/cache` — the same cache the `aws` CLI uses.
@@ -210,26 +234,6 @@ gpg-agent must already be warm when `credential-process` runs, since it has no T
 a 1Password service-account token. `keyrings.alt`'s `EncryptedKeyring` is a last resort: with no daemon to keep it
 unlocked it prompts in *every* new process, meaning a prompt on roughly every `aws` call and a hard failure
 anywhere non-interactive.
-
-## Shell prompt integration
-
-`brolly ps1` renders a colored `AWS_PROFILE` pill reflecting the **local, filesystem-only** state of the session
-token — no network call, no keychain access, no boto3 import:
-
-- **live** (amber) — token still valid.
-- **idle** (grey, clock glyph) — cached but lapsed; refreshes automatically on next use.
-- **gone** (red, cross glyph) — no cached token; run `brolly`.
-- **plain** (neutral grey) — not an SSO profile.
-
-Add it to your `PS1`. It needs a **[Nerd Font](https://www.nerdfonts.com/)** for the separators and glyphs:
-
-```bash
-export PS1='$(brolly ps1)\u@\h:\w\$ '
-```
-
-It reads whichever store the profile actually uses — the expiry sidecar for secure-mode profiles, the stock cache
-otherwise — so it stays accurate with no configuration. A dead 7-day session can't be detected locally, so it
-reads as `idle` rather than `gone`. Cost is ~10ms per prompt.
 
 ## How it compares
 
