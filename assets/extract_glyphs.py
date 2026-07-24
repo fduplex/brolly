@@ -36,6 +36,7 @@ WANTED = {
     'role': 0xF084,  # nf-fa-key
     'globe': 0xF0AC,  # nf-fa-globe
     'pulse': 0xF21E,  # nf-fa-heartbeat
+    'caret_right': 0xF0DA,  # nf-fa-caret-right
 }
 
 _OUT = Path(__file__).parent / 'nerd-glyphs.json'

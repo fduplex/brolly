@@ -80,16 +80,12 @@ picker (`↑`/`↓` or `j`/`k`, `enter` to select, `q` to quit); accounts first,
 one). Rewrites `sso_account_id`, `sso_role_name`, and `sso_account_name` in place — recording the account name is
 what lets the prompt show something friendlier than a raw ID.
 
-```console
-$ export AWS_PROFILE=corp-prod
-$ brolly switch
-  select account   ↑/↓ move · enter select · q quit
-      ACCOUNT       NAME
-      111111111111  corp-prod       ← current
-    ▶ 222222222222  corp-staging
+<p align="center">
+  <img src="assets/switch.svg" width="720" alt="brolly switch: an arrow-key picker choosing an account, then a role, then the confirmation line">
+</p>
 
-✔  corp-prod → 222222222222 (corp-staging) / AdministratorAccess
-```
+The circle marks where the profile points now, the highlighted row is the cursor. `$AWS_PROFILE` is untouched —
+only what it resolves to changed, which the next prompt shows.
 
 ### `brolly refresh [<profile>] [-s <session>]`
 

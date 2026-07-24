@@ -20,16 +20,22 @@ It renders on every shell prompt, so it stays **stdlib-only** — no boto3, no k
 
 ## Regenerating the README illustrations
 
-Both `.svg`s under `assets/` are generated, never hand-edited. Shared drawing primitives live in `termsvg.py`.
+Every `.svg` under `assets/` is generated, never hand-edited:
 
 ```bash
-uv run python assets/gen_prompt_states.py   # -> assets/prompt-states.svg (the ps1 pill's four states)
-uv run python assets/gen_ls_table.py        # -> assets/ls-table.svg     (a `brolly ls` run)
+uv run python assets/gen_prompt_states.py   # -> prompt-states.svg  (the ps1 pill's four states)
+uv run python assets/gen_ls_table.py        # -> ls-table.svg       (a `brolly ls` run)
+uv run python assets/gen_switch.py          # -> switch.svg         (a `brolly switch` session)
 ```
 
-`gen_ls_table.py` calls the real `cmd_ls` against a synthetic config and paints the ANSI it emits, so the table
-can't drift — but re-run it after touching `ls`. It pins `now` and `TZ=UTC` so the committed SVG is
-reproducible; leave those alone. `gen_prompt_states.py` does draw its own copy, so keep its colours in step with
+The kit under them: `termsvg.py` (palette, glyph outlines, window chrome, the pill), `ansi.py` (a tiny terminal
+— it replays cursor moves and reverse video, then paints the resulting grid), `climap.py` (cli.py's ANSI codes
+and glyph codepoints, read back off the module so they can't desync).
+
+`gen_ls_table.py` and `gen_switch.py` run the real `cmd_ls` / `cmd_switch` and screenshot what they write, so
+those two can't drift — but re-run them after touching `ls` or the picker. Only what would reach the network,
+the keyboard, or `~/.aws` is stubbed; `now` and `TZ=UTC` are pinned so the committed SVGs are reproducible.
+Leave those pins alone. `gen_prompt_states.py` does draw its own copy, so keep its colours in step with
 `_STYLES` in `src/brolly/prompt.py` and its labels in the shape the pill really prints (`session/profile ·
 account`).
 

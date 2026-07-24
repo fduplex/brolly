@@ -11,10 +11,7 @@ the expiry stamp never move) and the timezone (UTC, so the stamp does not follow
 Run `python assets/gen_ls_table.py` after touching the `ls` table; commit the regenerated .svg.
 """
 
-import io
 import os
-import re
-import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,20 +21,18 @@ time.tzset()
 
 from brolly import cli  # noqa: E402  — must follow the TZ pin above
 
+from ansi import paint, record  # noqa: E402
+from climap import COLORS, GLYPHS, GLYPH_EM  # noqa: E402
+
 from termsvg import (  # noqa: E402
     ACCENT,
+    BG,
     CW,
-    DIM,
     FG,
-    GREEN,
     MARGIN,
-    ORANGE,
     PROMPT_FG,
-    RED,
     ROWH,
     TITLE_H,
-    ink_height,
-    nf_glyph,
     pill,
     text,
     window,
@@ -91,38 +86,13 @@ FULL_CONFIG = {
     },
 }
 
-# ANSI SGR -> hex, and the Nerd Font codepoints `ls` writes -> nerd-glyphs.json names. The codepoints come
-# straight off cli.py rather than being repeated here, so a glyph swap there cannot desync this illustration.
-COLORS = {'0': FG, '2': DIM, '31': RED, '32': GREEN, '38;5;214': ORANGE}
-GLYPHS = {
-    cli._AWS: 'aws',
-    cli._PULSE: 'pulse',
-    cli._USER: 'user',
-    cli._LOCK: 'lock',
-    cli._ACCT: 'account',
-    cli._ROLE: 'role',
-    cli._GLOBE: 'globe',
-    cli._CHECK: 'check',
-    cli._CLOCK: 'clock',
-    cli._CROSS: 'cross',
-    cli._CURRENT: 'check_circle',
-}
-GLYPH_EM = 12.5  # every glyph set at one em, the way the terminal sets them — not tuned icon by icon
-
 LINEH = 22  # table line height
 TOP = TITLE_H + 16
 PROMPT = 'alex@lab:~/src$'
 COMMAND = ' brolly ls'
 
 
-class _Tty(io.StringIO):
-    """`cmd_ls` colours its output only when stdout is a tty; this is a tty as far as it can tell."""
-
-    def isatty(self) -> bool:
-        return True
-
-
-def capture_ls() -> str:
+def capture_ls() -> list[list]:
     """Run the real `ls` against the synthetic config with the clock and the expiry files stubbed out."""
 
     class _Frozen(datetime):
@@ -135,64 +105,11 @@ def capture_ls() -> str:
     cli._state_for = lambda path: SESSION_STATE[path.name][0]
     cli._read_expiry = lambda path: SESSION_STATE[path.name][1]
 
-    out = _Tty()
-    stdout, sys.stdout = sys.stdout, out
-    try:
-        cli.cmd_ls(FULL_CONFIG, CURRENT, check=False)
-    finally:
-        sys.stdout = stdout
-    return out.getvalue()
-
-
-def draw_line(line: str, y: float) -> list[str]:
-    """Paint one ANSI line onto the character grid: glyphs as outlines, everything else as pinned text runs."""
-    parts: list[str] = []
-    colour, col = FG, 0
-    run, run_col = '', 0
-
-    def flush() -> None:
-        nonlocal run
-        s, lead = run.strip(), len(run) - len(run.lstrip())
-        run = ''
-        if not s:
-            return
-        x = MARGIN + (run_col + lead) * CW
-        if set(s) == {'─'}:  # the header rule: a rect, so no viewer can leave gaps between the dashes
-            parts.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{len(s) * CW:.2f}" height="1" fill="{colour}"/>')
-        else:
-            parts.append(text(x, y, s, colour))
-
-    for chunk in re.split(r'(\033\[[0-9;]*m)', line):
-        if not chunk:
-            continue
-        if chunk.startswith('\033['):
-            flush()
-            colour = COLORS[chunk[2:-1]]
-            run_col = col
-            continue
-        for ch in chunk:
-            if ch in GLYPHS:
-                flush()
-                name = GLYPHS[ch]
-                parts.append(nf_glyph(name, MARGIN + (col + 0.5) * CW, y, colour, ink_height(name, GLYPH_EM)))
-                col += 1
-                run_col = col
-                continue
-            if not run:
-                run_col = col
-            run += ch
-            col += 1
-        flush()
-    flush()
-    return parts
+    return record(lambda: cli.cmd_ls(FULL_CONFIG, CURRENT, check=False)).trimmed()
 
 
 def main() -> None:
-    lines = capture_ls().split('\n')
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    while lines and not lines[-1].strip():
-        lines.pop()
+    rows = capture_ls()
 
     body: list[str] = []
     prompt_mid = TOP + ROWH / 2
@@ -203,12 +120,10 @@ def main() -> None:
     prompt_w = after + CW + (len(PROMPT) + len(COMMAND)) * CW
 
     table_top = TOP + ROWH + 10
-    for i, line in enumerate(lines):
-        body.extend(draw_line(line, table_top + i * LINEH + LINEH / 2))
+    body += paint(rows, x0=MARGIN, y0=table_top, lineh=LINEH, colours=COLORS, glyphs=GLYPHS, glyph_em=GLYPH_EM, bg=BG)
 
-    text_w = max(len(re.sub(r'\033\[[0-9;]*m', '', line).rstrip()) for line in lines) * CW
-    width = int(max(prompt_w, MARGIN + text_w) + MARGIN)
-    height = int(table_top + len(lines) * LINEH + 16)
+    width = int(max(prompt_w, MARGIN + max(len(r) for r in rows) * CW) + MARGIN)
+    height = int(table_top + len(rows) * LINEH + 16)
 
     svg = window(
         width,
