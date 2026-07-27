@@ -42,8 +42,12 @@ NOW = datetime(2026, 7, 24, 17, 18, tzinfo=UTC)
 CURRENT = 'corp-dev'  # what $AWS_PROFILE points at — `ls` paints this row's name orange
 
 # One live session and one dead one, so the table shows both halves of the status column. `corp` matches the
-# session used in the ps1 illustration; `acme` is invented.
-SESSION_STATE = {'acme': ('gone', None), 'corp': ('live', datetime(2026, 7, 25, 0, 37, tzinfo=UTC))}
+# session used in the ps1 illustration; `acme` is invented. Third field is the renewal flag `ls` notes beside the
+# expiry — a dead session never carries one, so `acme` leaves it unset.
+SESSION_STATE = {
+    'acme': ('gone', None, None),
+    'corp': ('live', datetime(2026, 7, 25, 0, 37, tzinfo=UTC), True),
+}
 
 FULL_CONFIG = {
     'sso_sessions': {
@@ -104,6 +108,7 @@ def capture_ls() -> list[list]:
     cli._expiry_path = lambda session, config, secure: Path(session)
     cli._state_for = lambda path: SESSION_STATE[path.name][0]
     cli._read_expiry = lambda path: SESSION_STATE[path.name][1]
+    cli._read_refreshable = lambda path, secure: SESSION_STATE[path.name][2]
 
     return record(lambda: cli.cmd_ls(FULL_CONFIG, CURRENT, check=False)).trimmed()
 

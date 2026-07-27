@@ -12,9 +12,13 @@ usage:
                                      create a new profile under an existing sso-session, pick its account/role,
                                      and leave it authenticated
   brolly ls [--no-check]             list every sso-session and its profiles, with token status; by default
-                                     silently probes each session over the network to distinguish a dead 7-day
-                                     session from a merely-lapsed hourly token — --no-check skips that and reads
+                                     silently probes each session over the network to distinguish a dead SSO
+                                     session from a merely-lapsed access token — --no-check skips that and reads
                                      local expiry files only
+
+The expiry `ls` shows is the SSO *access token*'s (8h from a fresh login, an hour per silent renewal), never the
+access-portal session's — that one lives only server-side, so each session line also notes whether it can renew
+without a browser at all.
 
 Bare `brolly` no longer force-logs-in — it refreshes the current profile; use `brolly login` for a forced login.
 
@@ -37,7 +41,7 @@ import termios
 import tty
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import boto3
 import botocore.session
@@ -59,6 +63,7 @@ type RoleName = str
 type AccessToken = str
 type AwsConfig = dict[str, Any]  # botocore's full_config / scoped-config nested-dict shape
 type Account = dict[str, str]  # a boto3 sso.list_accounts entry: accountId, accountName, emailAddress
+type ProfileRow = tuple[ProfileName, list[str], bool]  # (profile, cells in _HEADERS order, is-secure)
 
 _ORANGE = '\033[38;5;214m'
 _DIM = '\033[2m'
@@ -141,7 +146,7 @@ def _profile_sso(profile: ProfileName) -> tuple[SessionName, Region, AccountId |
 
 
 def _resolve_token(profile: ProfileName) -> AccessToken | None:
-    """A valid SSO access token — refreshed if the hourly one lapsed; None if the 7-day session is dead."""
+    """A valid SSO access token — refreshed if the cached one lapsed; None if the SSO session itself is dead."""
     resolver = create_token_resolver(botocore.session.Session(profile=profile))
     try:
         token = resolver.load_token()
@@ -154,7 +159,7 @@ def _ensure_token(profile: ProfileName, session_name: SessionName) -> AccessToke
     token = _resolve_token(profile)
     if token is not None:
         return token
-    # session fully expired (>7d): the refresh token is dead, so log in interactively, then resolve again
+    # the access-portal session itself has ended, so the refresh token is dead: log in interactively and re-resolve
     print(f"SSO session '{session_name}' expired — logging in…", file=sys.stderr)
     _aws('sso', 'login', '--sso-session', session_name, '--no-browser', '--use-device-code', capture=False)
     token = _resolve_token(profile)
@@ -396,6 +401,34 @@ def _read_expiry(path: Path) -> datetime | None:
     return expiry if expiry.tzinfo else expiry.replace(tzinfo=UTC)
 
 
+def _read_refreshable(path: Path, secure: bool) -> bool | None:
+    """Whether this session can get a new access token without a browser. None when the store can't say.
+
+    The two stores answer differently: botocore's plaintext cache holds the refresh token itself, so its presence
+    is the answer. A secure-mode sidecar is non-secret by design and instead records the flag brolly wrote beside
+    the expiry — absent on sidecars written before that flag existed, hence the third state.
+    """
+    try:
+        blob = json.loads(path.read_text())
+    except OSError, ValueError:
+        return None
+    if not secure:
+        return 'refreshToken' in blob
+    refreshable = blob.get('refreshable')
+    return refreshable if isinstance(refreshable, bool) else None
+
+
+def _renewal_note(state: State, refreshable: bool | None) -> tuple[str, str] | None:
+    """The (text, colour) trailing the expiry, saying whether this session renews itself or ends in a browser.
+
+    Only meaningful while a token exists — 'gone' already reports the absence, and an unknown flag stays silent
+    rather than guessing.
+    """
+    if state == 'gone' or refreshable is None:
+        return None
+    return ('auto-renews', _DIM) if refreshable else ('no refresh token — re-login at expiry', _ORANGE)
+
+
 def _countdown(expiry: datetime) -> str:
     total = int((expiry - datetime.now(UTC)).total_seconds())
     sign, total = ('-', -total) if total < 0 else ('', total)
@@ -442,7 +475,17 @@ def _probe_session(
         return None
 
 
-def _profile_cells(profile: ProfileName, cfg: AwsConfig, sso_region: Region) -> tuple[ProfileName, list[str], bool]:
+class _Block(NamedTuple):
+    """One session's resolved `ls` state — everything the table needs about it, sized and printed in one pass."""
+
+    session: SessionName
+    state: State
+    expiry: datetime | None
+    refreshable: bool | None
+    rows: list[ProfileRow]
+
+
+def _profile_cells(profile: ProfileName, cfg: AwsConfig, sso_region: Region) -> ProfileRow:
     """Raw (uncoloured) table cells for one profile row, plus whether it is secure — column order is _HEADERS."""
     account_id = cfg.get('sso_account_id') or cfg.get('brolly_sso_account_id') or '?'
     role = cfg.get('sso_role_name') or cfg.get('brolly_sso_role_name') or '?'
@@ -454,7 +497,7 @@ def _profile_cells(profile: ProfileName, cfg: AwsConfig, sso_region: Region) -> 
 
 
 def _print_profiles(
-    rows: list[tuple[ProfileName, list[str], bool]],
+    rows: list[ProfileRow],
     current: ProfileName | None,
     widths: list[int],
     profile_col: int,
@@ -483,7 +526,7 @@ def _print_profiles(
 
 def _print_ls_footer(
     current: ProfileName | None,
-    blocks: list[tuple[SessionName, State, datetime | None, list[tuple[ProfileName, list[str], bool]]]],
+    blocks: list[_Block],
     full_config: AwsConfig,
     tty: bool,
 ) -> None:
@@ -493,7 +536,7 @@ def _print_ls_footer(
         hint = '(export AWS_PROFILE=<profile> to pick one)'
         print(f'{indent}{_color("AWS_PROFILE not set", _DIM, tty)}  {_color(hint, _DIM, tty)}')
         return
-    found = next(((st, cells) for _, st, _, rows in blocks for prof, cells, _ in rows if prof == current), None)
+    found = next(((b.state, cells) for b in blocks for prof, cells, _ in b.rows if prof == current), None)
     if found is None:
         # set to a profile the table doesn't list: either absent from config, or present but non-SSO (ls lists
         # sso-sessions only) — no session state to show either way, so warn rather than fabricate a status
@@ -530,7 +573,7 @@ def cmd_ls(full_config: AwsConfig, current: ProfileName | None, check: bool) -> 
 
     # First pass: resolve every session's status and its profile rows so the profile columns can be sized once
     # across all sessions — the table stays aligned across session breaks instead of per-session.
-    blocks: list[tuple[SessionName, State, datetime | None, list[tuple[ProfileName, list[str], bool]]]] = []
+    blocks: list[_Block] = []
     for session_name in sorted(sso_sessions):
         members = _session_profiles(session_name, full_config)
         secure = any(_is_secure(c) for _, c in members)
@@ -541,14 +584,16 @@ def cmd_ls(full_config: AwsConfig, current: ProfileName | None, check: bool) -> 
             probed = _probe_session(session_name, members[0][0], secure, keychain_mod, keyring_module)
             if probed is not None:
                 state, expiry = probed
+        # read after any probe: a successful refresh rewrites the store, so this sees the post-refresh truth
+        refreshable = _read_refreshable(path, secure)
         rows = [_profile_cells(p, c, sso_region) for p, c in sorted(members)]
-        blocks.append((session_name, state, expiry, rows))
+        blocks.append(_Block(session_name, state, expiry, refreshable, rows))
 
-    all_rows = [cells for _, _, _, rows in blocks for _, cells, _ in rows]
+    all_rows = [cells for b in blocks for _, cells, _ in b.rows]
     # each column is sized to the wider of its widest data cell and its heading label (glyph+word can be widest)
     data_widths = (max((len(cells[c]) for cells in all_rows), default=0) for c in range(len(_HEADERS)))
     widths = [max(w, len(_HEADERS[c])) for c, w in enumerate(data_widths)]
-    session_width = max(len(_SESSION_HEADING), *(len(name) for name, *_ in blocks))
+    session_width = max(len(_SESSION_HEADING), *(len(b.session) for b in blocks))
     # the profile column sits right of the two session-line fields (session name, status), each with a 2-space gap
     profile_col = _SESSION_INDENT + session_width + 2 + _STATUS_WIDTH + 2
 
@@ -559,18 +604,23 @@ def cmd_ls(full_config: AwsConfig, current: ProfileName | None, check: bool) -> 
     print(_color(f'{" " * _SESSION_INDENT}{head_line}', _DIM, tty))  # every heading centred over its column
     # a dim rule spans the table, from the left indent to the region column's right edge (the header line's width)
     print(_color(f'{" " * _SESSION_INDENT}{"─" * len(head_line)}', _DIM, tty))
-    for session_name, state, expiry, rows in blocks:
-        colour, glyph = _STATUS_STYLES[state]
-        status_raw = f'{glyph} {state}'
+    for block in blocks:
+        colour, glyph = _STATUS_STYLES[block.state]
+        status_raw = f'{glyph} {block.state}'
         # name/status cells padded on raw length (ANSI excluded); the expiry detail is a colspan from profile_col
-        name_cell = _color(session_name, _ORANGE, tty) + ' ' * (session_width - len(session_name))
+        name_cell = _color(block.session, _ORANGE, tty) + ' ' * (session_width - len(block.session))
         status_cell = _color(status_raw, colour, tty) + ' ' * (_STATUS_WIDTH - len(status_raw))
-        detail = _status_detail(state, expiry)
+        detail = _status_detail(block.state, block.expiry)
         line = f'{" " * _SESSION_INDENT}{name_cell}  {status_cell}'
         if detail:
             line += f'  {_color(detail, colour, tty)}'
+        # the renewal note carries its own colour — a warning has to read as one even on a green 'live' row
+        note = _renewal_note(block.state, block.refreshable)
+        if note and detail:
+            text, note_colour = note
+            line += _color(f' · {text}', note_colour, tty)
         print(line)
-        _print_profiles(rows, current, widths, profile_col, tty)
+        _print_profiles(block.rows, current, widths, profile_col, tty)
         print()  # blank row after each session group, including the last
     _print_ls_footer(current, blocks, full_config, tty)
     print()  # one final blank line so the footer breathes before the shell prompt returns

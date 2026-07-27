@@ -34,10 +34,10 @@ def _secure_profile(session: str, account_id: str, role: str) -> dict:
     }
 
 
-def _expiry_file(path, *, hours: float) -> None:
+def _expiry_file(path, *, hours: float, **extra: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = (datetime.now(UTC) + timedelta(hours=hours)).isoformat()
-    path.write_text(json.dumps({'expiresAt': stamp}))
+    path.write_text(json.dumps({'expiresAt': stamp, **extra}))
 
 
 def _plaintext_cache_path(home, session: str):
@@ -376,6 +376,103 @@ def test_status_detail_past_expiry_says_expired():
     detail = cli._status_detail('idle', expiry)
     assert detail.startswith('expired ')
     assert detail.endswith('(-3h20m)')
+
+
+def test_renewal_note_flags_a_session_that_cannot_renew():
+    note = cli._renewal_note('live', False)
+    assert note is not None
+    text, colour = note
+    assert 're-login at expiry' in text
+    assert colour == cli._ORANGE  # a warning has to read as one even on an otherwise-green live row
+
+
+def test_renewal_note_is_dim_when_the_session_renews_itself():
+    assert cli._renewal_note('live', True) == ('auto-renews', cli._DIM)
+
+
+def test_renewal_note_silent_when_unknown_or_gone():
+    assert cli._renewal_note('live', None) is None  # a sidecar predating the flag: say nothing rather than guess
+    assert cli._renewal_note('gone', False) is None  # 'no valid token' already covers it
+
+
+def test_read_refreshable_reads_the_refresh_token_from_the_plaintext_cache(env):
+    path = _plaintext_cache_path(env, _ALPHA)
+    _expiry_file(path, hours=8, refreshToken='rt')
+    assert cli._read_refreshable(path, secure=False) is True
+
+    _expiry_file(path, hours=8)  # botocore's cache holds the refresh token itself, so absence is the answer
+    assert cli._read_refreshable(path, secure=False) is False
+
+
+def test_read_refreshable_reads_the_flag_from_a_secure_sidecar(env):
+    path = _secure_sidecar_path(env, _ALPHA)
+    _expiry_file(path, hours=8, refreshable=True)
+    assert cli._read_refreshable(path, secure=True) is True
+
+    _expiry_file(path, hours=8, refreshable=False)
+    assert cli._read_refreshable(path, secure=True) is False
+
+    _expiry_file(path, hours=8)  # sidecar written before the flag existed -> unknown, not False
+    assert cli._read_refreshable(path, secure=True) is None
+
+
+def test_read_refreshable_is_none_for_a_missing_or_corrupt_file(env, tmp_path):
+    assert cli._read_refreshable(tmp_path / 'nope.json', secure=False) is None
+    corrupt = tmp_path / 'corrupt.json'
+    corrupt.write_text('{not json')
+    assert cli._read_refreshable(corrupt, secure=True) is None
+
+
+def test_ls_session_line_warns_when_the_session_cannot_renew(env, monkeypatch, capsys):
+    full_config = _full_config(
+        {_ALPHA: 'us-east-1', _ZETA: 'us-west-2'},
+        {
+            'alpha-a': _plaintext_profile(_ALPHA, '1' * 12, 'Admin'),
+            'zeta-a': _plaintext_profile(_ZETA, '2' * 12, 'Admin'),
+        },
+    )
+    _expiry_file(_plaintext_cache_path(env, _ALPHA), hours=8)  # 8h token, no refresh token: a hard wall
+    _expiry_file(_plaintext_cache_path(env, _ZETA), hours=8, refreshToken='rt')
+    monkeypatch.setattr(sys.stdout, 'isatty', lambda: False)
+    cli.cmd_ls(full_config, 'none', False)
+    sections = _sections(capsys.readouterr().out)
+
+    # both read 'live' with an identical 8h countdown — the note is the only thing separating them
+    assert 'live' in sections[0] and 'live' in sections[1]
+    assert 'no refresh token — re-login at expiry' in sections[0]
+    assert 'auto-renews' in sections[1]
+    assert 'no refresh token' not in sections[1]
+
+
+def test_ls_renewal_note_is_omitted_when_the_store_cannot_say(env, monkeypatch, capsys):
+    full_config = _full_config({_ALPHA: 'us-east-1'}, {'alpha-a': _secure_profile(_ALPHA, '1' * 12, 'Admin')})
+    _expiry_file(_secure_sidecar_path(env, _ALPHA), hours=8)  # secure sidecar predating the flag
+    monkeypatch.setattr(sys.stdout, 'isatty', lambda: False)
+    cli.cmd_ls(full_config, 'none', False)
+    section = _sections(capsys.readouterr().out)[0]
+
+    assert 'live' in section and 'expires' in section
+    assert 'auto-renews' not in section and 'no refresh token' not in section
+
+
+def test_ls_gone_session_gets_no_renewal_note(env, capsys):
+    full_config = _full_config({_ALPHA: 'us-east-1'}, {'alpha-a': _plaintext_profile(_ALPHA, '1' * 12, 'Admin')})
+    cli.cmd_ls(full_config, 'none', False)  # no expiry file at all -> gone
+    section = _sections(capsys.readouterr().out)[0]
+
+    assert 'no valid token' in section
+    assert 'auto-renews' not in section and 'no refresh token' not in section
+
+
+def test_ls_renewal_note_is_coloured_independently_of_the_status(env, monkeypatch, capsys):
+    full_config = _full_config({_ALPHA: 'us-east-1'}, {'alpha-a': _plaintext_profile(_ALPHA, '1' * 12, 'Admin')})
+    _expiry_file(_plaintext_cache_path(env, _ALPHA), hours=8)
+    monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
+    cli.cmd_ls(full_config, 'none', False)
+    line = next(line for line in capsys.readouterr().out.splitlines() if line.startswith(f'   {cli._ORANGE}{_ALPHA}'))
+
+    assert cli._GREEN in line  # the live status/expiry stay green
+    assert f'{cli._ORANGE} · no refresh token' in line  # the note breaks out of that colour
 
 
 def test_ls_raises_without_sso_sessions(env):

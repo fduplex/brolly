@@ -101,8 +101,8 @@ profile 'corp-prod' is under session 'corp', not 'customer' — use -s corp to t
 ```
 
 Under the hood it runs `aws sts get-caller-identity --profile <target>`, which forces credential resolution and
-lets botocore refresh the hourly token — but only when that token is lapsed or near expiry, so a healthy one
-isn't reset. If the 7-day session is dead it falls through to a device-code login and retries. It also backfills
+lets botocore refresh the access token — but only when that token is lapsed or near expiry, so a healthy one
+isn't reset. If the SSO session is dead it falls through to a device-code login and retries. It also backfills
 a missing `sso_account_name` (one `list_accounts` call, made only when absent).
 
 ### `brolly add <profile> [-s <session>]`
@@ -132,6 +132,25 @@ truly-dead session apart from a merely-lapsed token; `--no-check` skips that and
 
 The current profile is the orange one. `secure` marks which profiles keep their token in the OS keychain, and the
 whole table needs a **[Nerd Font](https://www.nerdfonts.com/)** for its glyphs, same as the prompt pill.
+
+#### Reading the expiry
+
+The countdown is the **access token's**, not your session's. IAM Identity Center issues that token with a fixed
+8-hour life on a fresh login (an hour per silent renewal after that) regardless of the access-portal session
+duration your admin configured — so an 8-hour countdown says nothing about whether you have 8 hours or 90 days
+before the next browser prompt. The real session lives server-side and is not visible to any client.
+
+What *is* knowable locally is whether the session holds a refresh token, so each session line says so:
+
+```console
+   corp     live    expires 2026-07-25 00:37 (7h19m) · auto-renews
+   acme     live    expires 2026-07-25 00:41 (7h23m) · no refresh token — re-login at expiry
+```
+
+`auto-renews` means new access tokens arrive silently until the access-portal session ends. `no refresh token`
+means this session hits a hard wall when the countdown reaches zero — fix it with `brolly login -s <session>`, or
+`brolly secure login -s <session>` in secure mode. The note is omitted when the store can't say (a secure-mode
+sidecar written before brolly recorded the flag) rather than guessed at.
 
 ### Common tasks
 
@@ -168,7 +187,7 @@ export PS1='$(brolly ps1)\u@\h:\w\$ '
 ```
 
 It reads whichever store the profile actually uses — the expiry sidecar for secure-mode profiles, the stock cache
-otherwise — so it stays accurate with no configuration. A dead 7-day session can't be detected locally, so it
+otherwise — so it stays accurate with no configuration. A dead SSO session can't be detected locally, so it
 reads as `idle` rather than `gone`. Cost is ~10ms per prompt.
 
 ## Secure mode (OS keychain)
@@ -197,15 +216,18 @@ through brolly. `refresh` and `switch` keep working and stay in secure mode.
 
 ### `brolly secure login` / `brolly secure disable`
 
-`login` re-authorizes a session whose 7-day window has fully lapsed — rarely needed, since refresh is silent.
+`login` re-authorizes a session whose access-portal window has fully lapsed — rarely needed, since refresh is
+silent. It is also the fix if `ls` reports a session as `no refresh token`.
 `disable` reverts every secured profile to a stock plaintext-cache profile and deletes the keychain token: a
 clean, complete undo.
 
 ### How it works
 
 - **The token** (with its refresh token) lives in the keychain under service `brolly-sso`, keyed the way botocore
-  keys its own cache. brolly plugs a keychain-backed cache into botocore's token provider, so **silent hourly
-  refresh still happens** — no reimplementation, just a different vault.
+  keys its own cache. brolly plugs a keychain-backed cache into botocore's token provider, so **silent refresh
+  still happens** — no reimplementation, just a different vault. The device login registers its OIDC client for
+  the `refresh_token` grant with the `sso:account:access` scope, which is what makes IAM Identity Center hand back
+  a refresh token at all.
 - **A secured profile** keeps `sso_session` but moves `sso_account_id` / `sso_role_name` under `brolly_sso_*` and
   adds `credential_process`. That combination deactivates botocore's built-in SSO credential provider so
   resolution flows through brolly — otherwise botocore would find the now-absent plaintext token and fail.

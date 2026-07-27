@@ -61,10 +61,13 @@ class _FakeOidc:
         class AccessDeniedException(Exception):
             pass
 
-    def __init__(self, pending_rounds: int = 1) -> None:
+    def __init__(self, pending_rounds: int = 1, with_refresh_token: bool = True) -> None:
         self._pending = pending_rounds
+        self._with_refresh_token = with_refresh_token
+        self.registration_kwargs: dict[str, object] = {}
 
-    def register_client(self, **_: object) -> dict[str, object]:
+    def register_client(self, **kwargs: object) -> dict[str, object]:
+        self.registration_kwargs = kwargs
         return {
             'clientId': 'cid',
             'clientSecret': 'csecret',
@@ -84,7 +87,10 @@ class _FakeOidc:
         if self._pending > 0:
             self._pending -= 1
             raise self.exceptions.AuthorizationPendingException()
-        return {'accessToken': 'access-tok', 'expiresIn': 28800, 'refreshToken': 'refresh-tok'}
+        token: dict[str, object] = {'accessToken': 'access-tok', 'expiresIn': 28800}
+        if self._with_refresh_token:
+            token['refreshToken'] = 'refresh-tok'
+        return token
 
 
 class _FakeSso:
@@ -306,7 +312,11 @@ def test_keychain_cache_roundtrip_and_sidecar(aws_env, monkeypatch):
 
     sidecar = keychain._sidecar_path(key)
     assert sidecar.is_file()
-    assert json.loads(sidecar.read_text()) == {'session': _SESSION, 'expiresAt': expires.isoformat()}
+    assert json.loads(sidecar.read_text()) == {
+        'session': _SESSION,
+        'expiresAt': expires.isoformat(),
+        'refreshable': False,  # this blob carries no refresh token
+    }
 
     del cache[key]
     assert key not in cache
@@ -380,15 +390,20 @@ def test_credential_process_reports_dead_token(aws_env, monkeypatch):
         keychain.cmd_credential_process(_PROFILE)
 
 
+_SSO_CONFIG = {'sso_start_url': 'https://corp.awsapps.com/start', 'sso_region': 'us-east-1'}
+
+
+def _login(monkeypatch, keyring_module, *, oidc: _FakeOidc, sso_config: dict | None = None) -> None:
+    monkeypatch.setattr(keychain, 'sleep', lambda _: None)
+    monkeypatch.setattr(keychain.boto3, 'client', lambda *a, **k: oidc)
+    cache = keychain._KeychainTokenCache(keyring_module, _SESSION)
+    keychain._device_login(_SESSION, sso_config or _SSO_CONFIG, cache)
+
+
 def test_device_login_stores_blob_and_sidecar(aws_env, monkeypatch):
     monkeypatch.setenv('AWS_CONFIG_FILE', str(aws_env))
-    monkeypatch.setattr(keychain, 'sleep', lambda _: None)
-    fake_oidc = _FakeOidc(pending_rounds=2)  # exercise the polling loop
-    monkeypatch.setattr(keychain.boto3, 'client', lambda *a, **k: fake_oidc)
-
     fake_keyring = _FakeKeyring()
-    cache = keychain._KeychainTokenCache(fake_keyring, _SESSION)
-    keychain._device_login(_SESSION, 'https://corp.awsapps.com/start', 'us-east-1', cache)
+    _login(monkeypatch, fake_keyring, oidc=_FakeOidc(pending_rounds=2))  # exercise the polling loop
 
     blob = json.loads(fake_keyring.get_password('brolly-sso', keychain._cache_key(_SESSION)))
     assert blob['accessToken'] == 'access-tok'
@@ -396,4 +411,86 @@ def test_device_login_stores_blob_and_sidecar(aws_env, monkeypatch):
     assert blob['clientId'] == 'cid'
     assert blob['clientSecret'] == 'csecret'
     assert 'registrationExpiresAt' in blob
-    assert keychain._sidecar_path(keychain._cache_key(_SESSION)).is_file()
+    sidecar = keychain._sidecar_path(keychain._cache_key(_SESSION))
+    assert sidecar.is_file()
+    assert json.loads(sidecar.read_text())['refreshable'] is True
+
+
+def test_device_login_registers_for_the_refresh_token_grant(aws_env, monkeypatch):
+    """Load-bearing: without this scope and grant, IAM Identity Center returns no refresh token and the session
+    is stranded at the access token's 8 hours regardless of the configured access-portal session duration."""
+    monkeypatch.setenv('AWS_CONFIG_FILE', str(aws_env))
+    fake_oidc = _FakeOidc()
+    _login(monkeypatch, _FakeKeyring(), oidc=fake_oidc)
+
+    assert fake_oidc.registration_kwargs['scopes'] == ['sso:account:access']
+    assert fake_oidc.registration_kwargs['grantTypes'] == [keychain._DEVICE_GRANT, 'refresh_token']
+    assert fake_oidc.registration_kwargs['clientType'] == 'public'
+
+
+def test_device_login_unions_configured_registration_scopes_with_the_minimum(aws_env, monkeypatch):
+    monkeypatch.setenv('AWS_CONFIG_FILE', str(aws_env))
+    fake_oidc = _FakeOidc()
+    sso_config = {**_SSO_CONFIG, 'sso_registration_scopes': 'sso:account:access, codewhisperer:completions'}
+    _login(monkeypatch, _FakeKeyring(), oidc=fake_oidc, sso_config=sso_config)
+
+    # configured scopes are honoured, the required one is never dropped, and it is not listed twice
+    assert fake_oidc.registration_kwargs['scopes'] == ['sso:account:access', 'codewhisperer:completions']
+
+
+def test_registration_scopes_defaults_to_the_minimum_when_unconfigured():
+    assert keychain._registration_scopes({}) == ['sso:account:access']
+    assert keychain._registration_scopes({'sso_registration_scopes': ''}) == ['sso:account:access']
+
+
+def test_device_login_warns_when_no_refresh_token_is_issued(aws_env, monkeypatch, capsys):
+    monkeypatch.setenv('AWS_CONFIG_FILE', str(aws_env))
+    fake_keyring = _FakeKeyring()
+    _login(monkeypatch, fake_keyring, oidc=_FakeOidc(with_refresh_token=False))
+
+    blob = json.loads(fake_keyring.get_password('brolly-sso', keychain._cache_key(_SESSION)))
+    assert 'refreshToken' not in blob  # nothing fabricated
+    assert json.loads(keychain._sidecar_path(keychain._cache_key(_SESSION)).read_text())['refreshable'] is False
+    err = capsys.readouterr().err
+    assert 'no refresh token' in err and 'sso:account:access' in err  # loud, and says what to check
+
+
+def test_secure_enable_reauthorizes_a_stored_token_that_cannot_renew(aws_env, monkeypatch, capsys):
+    """A session secured before the refresh_token grant was requested must not be left stranded at 8 hours."""
+    _write_config(aws_env, secure=False)
+    fake_keyring = _FakeKeyring()
+    stale = {'accessToken': 'stale-tok', 'expiresAt': (datetime.now(UTC) + timedelta(hours=8)).isoformat()}
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(stale))
+    monkeypatch.setattr(keychain, '_import_keyring', lambda: fake_keyring)
+    monkeypatch.setattr(keychain, '_autodetect_backend', lambda _: 'fake.Backend')
+    monkeypatch.setattr(keychain, '_select_backend', lambda *a: None)
+    monkeypatch.setattr(keychain, '_backend_label', lambda _: 'fake')
+    monkeypatch.setattr(keychain, 'sleep', lambda _: None)
+    monkeypatch.setattr(keychain.boto3, 'client', lambda *a, **k: _FakeOidc())
+
+    full_config = botocore.session.Session().full_config
+    keychain.cmd_secure_enable(_SESSION, full_config)
+
+    blob = json.loads(fake_keyring.get_password('brolly-sso', keychain._cache_key(_SESSION)))
+    assert blob['refreshToken'] == 'refresh-tok'  # re-authorized rather than left as-is
+    assert 'cannot renew silently' in capsys.readouterr().err
+
+
+def test_secure_enable_keeps_a_stored_token_that_can_renew(aws_env, monkeypatch, capsys):
+    _write_config(aws_env, secure=False)
+    fake_keyring = _FakeKeyring()
+    good = {**_live_blob(), 'refreshToken': 'already-good'}
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(good))
+    monkeypatch.setattr(keychain, '_import_keyring', lambda: fake_keyring)
+    monkeypatch.setattr(keychain, '_autodetect_backend', lambda _: 'fake.Backend')
+    monkeypatch.setattr(keychain, '_select_backend', lambda *a: None)
+    monkeypatch.setattr(keychain, '_backend_label', lambda _: 'fake')
+
+    def no_login(*_a: object, **_k: object) -> None:
+        raise AssertionError('a healthy token must not trigger another device login')
+
+    monkeypatch.setattr(keychain, '_device_login', no_login)
+    keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    blob = json.loads(fake_keyring.get_password('brolly-sso', keychain._cache_key(_SESSION)))
+    assert blob['refreshToken'] == 'already-good'  # untouched

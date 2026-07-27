@@ -50,7 +50,14 @@ type TokenBlob = dict[str, Any]
 
 _KEYRING_SERVICE = 'brolly-sso'
 _DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code'
+_REFRESH_GRANT = 'refresh_token'
 _CLIENT_NAME = 'brolly'
+
+# IAM Identity Center only returns a refresh token when the client registration asks for at least this scope, and
+# only issues one at all when the registration declares the refresh_token grant. Without both, CreateToken hands
+# back a bare 8-hour access token that botocore cannot renew — the session then dies at 8h no matter how long the
+# access-portal session duration is set to. brolly needs this scope anyway to list accounts and roles.
+_ACCOUNT_SCOPE = 'sso:account:access'
 
 _NO_KEYRING_BACKEND = (
     'no OS keychain backend is available, so brolly cannot store tokens securely.\n'
@@ -186,11 +193,15 @@ def _sidecar_path(cache_key: str) -> Path:
     return _aws_dir() / 'brolly' / f'{cache_key}.json'
 
 
-def _write_sidecar(session_name: SessionName, cache_key: str, expires_at: object) -> None:
-    """Persist the non-secret expiry alongside the config so the prompt pill never touches the keychain."""
+def _write_sidecar(session_name: SessionName, cache_key: str, expires_at: object, refreshable: bool) -> None:
+    """Persist the non-secret expiry alongside the config so the prompt pill never touches the keychain.
+
+    ``refreshable`` mirrors whether the stored blob carries a refresh token — the one fact that separates a token
+    that renews silently from one that ends in a browser, and the only way `ls` can tell without a keychain read.
+    """
     path = _sidecar_path(cache_key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({'session': session_name, 'expiresAt': _iso(expires_at)}))
+    path.write_text(json.dumps({'session': session_name, 'expiresAt': _iso(expires_at), 'refreshable': refreshable}))
 
 
 def _remove_sidecar(cache_key: str) -> None:
@@ -258,7 +269,7 @@ class _KeychainTokenCache:
 
     def __setitem__(self, cache_key: str, value: TokenBlob) -> None:
         self._run(self._keyring.set_password, _KEYRING_SERVICE, cache_key, json.dumps(value, default=_json_default))
-        _write_sidecar(self._session_name, cache_key, value.get('expiresAt'))
+        _write_sidecar(self._session_name, cache_key, value.get('expiresAt'), 'refreshToken' in value)
 
     def __delitem__(self, cache_key: str) -> None:
         try:
@@ -301,14 +312,27 @@ def _secure_profile(profile: ProfileName, account_id: AccountId, role: RoleName,
     _config_remove_keys(profile, {'sso_account_id', 'sso_role_name'})
 
 
-def _device_login(session_name: SessionName, start_url: str, sso_region: Region, cache: _KeychainTokenCache) -> None:
+def _registration_scopes(sso_config: AwsConfig) -> list[str]:
+    """The scopes to register with: the sso-session's ``sso_registration_scopes``, always including _ACCOUNT_SCOPE."""
+    configured = [s.strip() for s in sso_config.get('sso_registration_scopes', '').split(',') if s.strip()]
+    return list(dict.fromkeys([_ACCOUNT_SCOPE, *configured]))
+
+
+def _device_login(session_name: SessionName, sso_config: AwsConfig, cache: _KeychainTokenCache) -> None:
     """Run the sso-oidc device-authorization flow and store the resulting token blob (incl. refresh token) in keychain.
 
     botocore's token provider only *refreshes* an existing token; it never performs the initial device login, so
     brolly drives the OIDC dance itself. The blob's key set matches exactly what botocore's refresh path reads.
     """
+    start_url: str = sso_config['sso_start_url']
+    sso_region: Region = sso_config['sso_region']
     oidc = boto3.client('sso-oidc', region_name=sso_region, config=Config(signature_version=UNSIGNED))
-    registration = oidc.register_client(clientName=_CLIENT_NAME, clientType='public')
+    registration = oidc.register_client(
+        clientName=_CLIENT_NAME,
+        clientType='public',
+        scopes=_registration_scopes(sso_config),
+        grantTypes=[_DEVICE_GRANT, _REFRESH_GRANT],
+    )
     authorization = oidc.start_device_authorization(
         clientId=registration['clientId'], clientSecret=registration['clientSecret'], startUrl=start_url
     )
@@ -341,12 +365,12 @@ def _device_login(session_name: SessionName, start_url: str, sso_region: Region,
         except oidc.exceptions.AccessDeniedException:
             raise SystemExit('authorization was denied') from None
 
-    now = datetime.now(UTC)
+    expires_at = datetime.now(UTC) + timedelta(seconds=token['expiresIn'])
     blob: TokenBlob = {
         'startUrl': start_url,
         'region': sso_region,
         'accessToken': token['accessToken'],
-        'expiresAt': (now + timedelta(seconds=token['expiresIn'])).isoformat(),
+        'expiresAt': expires_at.isoformat(),
         'clientId': registration['clientId'],
         'clientSecret': registration['clientSecret'],
         'registrationExpiresAt': datetime.fromtimestamp(registration['clientSecretExpiresAt'], tz=UTC).isoformat(),
@@ -355,6 +379,13 @@ def _device_login(session_name: SessionName, start_url: str, sso_region: Region,
         blob['refreshToken'] = token['refreshToken']
     cache[_cache_key(session_name)] = blob
     print('✓ authorized — SSO token stored in your OS keychain', file=sys.stderr)
+    if 'refreshToken' not in blob:
+        print(
+            f'! IAM Identity Center issued no refresh token for this session, so it cannot renew silently — '
+            f'expect another device login at {expires_at.astimezone():%Y-%m-%d %H:%M}.\n'
+            f"  Check that the '{session_name}' sso-session is allowed the {_ACCOUNT_SCOPE} scope.",
+            file=sys.stderr,
+        )
 
 
 def load_secure_token(
@@ -437,8 +468,17 @@ def cmd_secure_enable(session_name: SessionName, full_config: AwsConfig, backend
     print(f'→ keychain backend: {_backend_label(keyring_module)}  (saved to {_config_path()})', file=sys.stderr)
     sso_config = full_config['sso_sessions'][session_name]
     cache = _KeychainTokenCache(keyring_module, session_name)
-    if _cache_key(session_name) not in cache:
-        _device_login(session_name, sso_config['sso_start_url'], sso_config['sso_region'], cache)
+    try:
+        stored: TokenBlob | None = cache[_cache_key(session_name)]
+    except KeyError:
+        stored = None
+    if stored is None:
+        _device_login(session_name, sso_config, cache)
+    elif 'refreshToken' not in stored:
+        # stored before brolly registered for the refresh_token grant — that token strands the session at the
+        # access token's 8 hours, so re-authorize now rather than at its next expiry
+        print(f"→ stored token for '{session_name}' cannot renew silently — re-authorizing", file=sys.stderr)
+        _device_login(session_name, sso_config, cache)
 
     # The token is safely in the keychain now — drop the redundant plaintext copy botocore/aws-cli left behind.
     if _remove_plaintext_token(session_name):
@@ -477,7 +517,7 @@ def cmd_secure_login(session_name: SessionName, full_config: AwsConfig) -> None:
     print(f'→ keychain backend: {_backend_label(keyring_module)}', file=sys.stderr)
     sso_config = full_config['sso_sessions'][session_name]
     cache = _KeychainTokenCache(keyring_module, session_name)
-    _device_login(session_name, sso_config['sso_start_url'], sso_config['sso_region'], cache)
+    _device_login(session_name, sso_config, cache)
 
 
 def cmd_secure_switch(profile: ProfileName, full_config: AwsConfig) -> None:
