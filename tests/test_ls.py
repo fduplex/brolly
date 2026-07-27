@@ -142,6 +142,33 @@ def test_ls_secure_column_uses_check_for_secure_and_cross_for_plain(env, capsys)
     assert cli._CROSS in plain_row and cli._CHECK not in plain_row
 
 
+def test_ls_flags_a_leaked_plaintext_blob_under_a_secured_session(env, capsys):
+    full_config = _full_config({_ALPHA: 'us-east-1'}, {'alpha-secure': _secure_profile(_ALPHA, '1' * 12, 'Admin')})
+    plaintext = _plaintext_cache_path(env, _ALPHA)
+    plaintext.parent.mkdir(parents=True)
+    plaintext.write_text('{"accessToken": "stale", "refreshToken": "leaked"}')
+
+    cli.cmd_ls(full_config, 'none', False)
+    out = capsys.readouterr().out
+
+    assert "still holds this session's token" in out
+    assert f'brolly secure enable -s {_ALPHA}' in out
+    assert plaintext.is_file()  # ls reports; it never mutates
+
+
+def test_ls_omits_the_leaked_warning_for_a_clean_secured_session(env, capsys):
+    full_config = _full_config({_ALPHA: 'us-east-1'}, {'alpha-secure': _secure_profile(_ALPHA, '1' * 12, 'Admin')})
+    cli.cmd_ls(full_config, 'none', False)  # no plaintext blob planted
+    assert "still holds this session's token" not in capsys.readouterr().out
+
+
+def test_ls_omits_the_leaked_warning_for_a_plaintext_session_with_its_own_legitimate_cache_file(env, capsys):
+    full_config = _full_config({_ALPHA: 'us-east-1'}, {'alpha-plain': _plaintext_profile(_ALPHA, '1' * 12, 'Admin')})
+    _expiry_file(_plaintext_cache_path(env, _ALPHA), hours=8)  # its own cache file — not a leak, the session is plain
+    cli.cmd_ls(full_config, 'none', False)
+    assert "still holds this session's token" not in capsys.readouterr().out
+
+
 def test_ls_secure_cell_is_centered_in_its_column(env, monkeypatch, capsys):
     full_config = _full_config(
         {_ALPHA: 'us-east-1'},

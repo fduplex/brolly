@@ -18,6 +18,16 @@ uv run pytest
 It renders on every shell prompt, so it stays **stdlib-only** — no boto3, no keyring, no network, no subprocess.
 `tests/test_prompt.py` enforces the boto3 half of that; the rest is on you.
 
+## Secure mode dispatches per session, not per command
+
+`brolly secure` has exactly two subcommands, `enable`/`disable` — there is no `secure login` or other
+secure-flavoured twin. Every other command (`login`, `refresh`, `switch`, `add`, bare `brolly`) calls
+`_session_is_secure()` in `cli.py` and routes itself into the keychain path when the session is secured. If you
+add a new top-level command that establishes or refreshes credentials, wire it the same way — a command that
+shells out to `aws sso login` (or otherwise writes the plaintext cache) without checking the session's mode first
+will silently overwrite a secured session's refresh token in `~/.aws/sso/cache`, which is the bug this dispatch
+rule exists to prevent.
+
 ## Regenerating the README illustrations
 
 Every `.svg` under `assets/` is generated, never hand-edited:

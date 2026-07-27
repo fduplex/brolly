@@ -17,8 +17,13 @@ from brolly import keychain
 
 @pytest.fixture(autouse=True)
 def _isolate_brolly_config(tmp_path, monkeypatch):
-    """Keep every test off the real ~/.aws/brolly (config + sidecars both live under the aws-config dir)."""
+    """Keep every test off the real ~/.aws/brolly (config + sidecars) and off the real ~/.aws/sso/cache.
+
+    HOME matters as well as AWS_CONFIG_FILE: the plaintext token path is botocore's fixed home-relative one, and
+    the secure paths delete from it.
+    """
     monkeypatch.setenv('AWS_CONFIG_FILE', str(tmp_path / 'config'))
+    monkeypatch.setenv('HOME', str(tmp_path))
 
 
 class _FakeKeyring:
@@ -386,7 +391,7 @@ def test_credential_process_reports_dead_token(aws_env, monkeypatch):
     _write_config(aws_env, secure=True)
     fake_keyring = _FakeKeyring()  # empty: no token stored
     monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake_keyring)
-    with pytest.raises(SystemExit, match='brolly secure login'):
+    with pytest.raises(SystemExit, match='brolly login'):
         keychain.cmd_credential_process(_PROFILE)
 
 
@@ -494,3 +499,219 @@ def test_secure_enable_keeps_a_stored_token_that_can_renew(aws_env, monkeypatch,
 
     blob = json.loads(fake_keyring.get_password('brolly-sso', keychain._cache_key(_SESSION)))
     assert blob['refreshToken'] == 'already-good'  # untouched
+
+
+def test_secure_enable_writes_the_secured_session_record(aws_env, monkeypatch):
+    """Finding 1: without this record, a session whose profiles later all become skeletons would read as plaintext
+    again — `enable` must write it, not just reshape the profiles."""
+    _write_config(aws_env, secure=False)
+    fake_keyring = _FakeKeyring()
+    good = {**_live_blob(), 'refreshToken': 'already-good'}
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(good))
+    monkeypatch.setattr(keychain, '_import_keyring', lambda: fake_keyring)
+    monkeypatch.setattr(keychain, '_autodetect_backend', lambda _: 'fake.Backend')
+    monkeypatch.setattr(keychain, '_select_backend', lambda *a: None)
+    monkeypatch.setattr(keychain, '_backend_label', lambda _: 'fake')
+
+    def no_login(*_a: object, **_k: object) -> None:
+        raise AssertionError('a healthy token must not trigger another device login')
+
+    monkeypatch.setattr(keychain, '_device_login', no_login)
+
+    assert _SESSION not in keychain._read_config().get('secured_sessions', [])
+    keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+    assert _SESSION in keychain._read_config()['secured_sessions']
+
+
+def test_secure_disable_removes_the_secured_session_record(aws_env, monkeypatch):
+    _write_config(aws_env, secure=True)
+    keychain._record_secured_session(_SESSION, True)
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: _FakeKeyring())
+
+    assert _SESSION in keychain._read_config()['secured_sessions']
+    keychain.cmd_secure_disable(_SESSION, botocore.session.Session().full_config)
+    assert _SESSION not in keychain._read_config().get('secured_sessions', [])
+
+
+def test_purge_plaintext_token_removes_a_planted_file_and_reports_it(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('HOME', str(tmp_path))
+    cache_dir = tmp_path / '.aws' / 'sso' / 'cache'
+    cache_dir.mkdir(parents=True)
+    token = cache_dir / f'{keychain._cache_key(_SESSION)}.json'
+    token.write_text('{"accessToken": "plaintext-cruft", "refreshToken": "leaked"}')
+
+    keychain._purge_plaintext_token(_SESSION)
+
+    assert not token.exists()
+    assert f"removed plaintext token cache for session '{_SESSION}'" in capsys.readouterr().err
+
+
+def test_purge_plaintext_token_is_silent_and_safe_when_nothing_to_remove(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('HOME', str(tmp_path))  # no ~/.aws/sso/cache at all
+    keychain._purge_plaintext_token(_SESSION)  # must not raise
+    assert capsys.readouterr().err == ''
+
+
+def test_purge_session_plaintext_removes_the_blob_when_nothing_still_needs_it(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('HOME', str(tmp_path))
+    plaintext = keychain._plaintext_token_path(_SESSION)
+    plaintext.parent.mkdir(parents=True)
+    plaintext.write_text('{"accessToken": "stale", "refreshToken": "leaked"}')
+    full_config = {'profiles': {_PROFILE: {'sso_session': _SESSION, 'brolly_sso_account_id': _ACCOUNT}}}
+
+    keychain.purge_session_plaintext(_SESSION, full_config)
+
+    assert not plaintext.exists()
+    assert f"removed plaintext token cache for session '{_SESSION}'" in capsys.readouterr().err
+
+
+def test_purge_session_plaintext_leaves_the_file_when_a_stock_sibling_profile_exists(tmp_path, monkeypatch, capsys):
+    """The mixed-session guard: a stock sibling still resolves its credentials out of this exact blob, so deleting
+    it would break a working profile with nothing but a browser login to get it back."""
+    monkeypatch.setenv('HOME', str(tmp_path))
+    plaintext = keychain._plaintext_token_path(_SESSION)
+    plaintext.parent.mkdir(parents=True)
+    plaintext.write_text('{"accessToken": "stale", "refreshToken": "leaked"}')
+    full_config = {
+        'profiles': {_PROFILE: {'sso_session': _SESSION, 'sso_account_id': _ACCOUNT, 'sso_role_name': _ROLE}}
+    }
+
+    keychain.purge_session_plaintext(_SESSION, full_config)
+
+    assert plaintext.is_file()  # left alone — the sibling still needs it
+    err = capsys.readouterr().err
+    assert _PROFILE in err
+    assert f"session '{_SESSION}' is secured" in err
+
+
+def test_purge_session_plaintext_is_a_cheap_noop_when_no_plaintext_file_exists(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('HOME', str(tmp_path))  # no ~/.aws/sso/cache at all
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise AssertionError('must not scan profiles past the one stat that finds nothing to purge')
+
+    monkeypatch.setattr(keychain, '_stock_profiles', boom)
+    keychain.purge_session_plaintext(_SESSION, {'profiles': {}})  # must not raise
+
+    assert capsys.readouterr().err == ''
+
+
+def test_device_login_purges_a_planted_plaintext_token(aws_env, monkeypatch, capsys):
+    monkeypatch.setenv('AWS_CONFIG_FILE', str(aws_env))
+    plaintext = keychain._plaintext_token_path(_SESSION)
+    plaintext.parent.mkdir(parents=True)
+    plaintext.write_text('{"accessToken": "stale", "refreshToken": "leaked"}')
+
+    _login(monkeypatch, _FakeKeyring(), oidc=_FakeOidc())
+
+    assert not plaintext.is_file()
+    assert f"removed plaintext token cache for session '{_SESSION}'" in capsys.readouterr().err
+
+
+_SSO_CONFIG_FOR_TOKEN = {'sso_sessions': {_SESSION: _SSO_CONFIG}}
+
+
+def test_ensure_secure_token_returns_the_live_token_without_a_device_login(aws_env):
+    _write_config(aws_env, secure=True)
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(_live_blob()))
+
+    def no_login(*_a: object, **_k: object) -> None:
+        raise AssertionError('a live keychain token must not trigger a device login')
+
+    token = keychain._ensure_secure_token(_PROFILE, _SESSION, _SSO_CONFIG_FOR_TOKEN, fake_keyring)
+    assert token == 'access-tok'
+
+
+def test_ensure_secure_token_runs_a_device_login_when_none_is_stored(aws_env, monkeypatch, capsys):
+    _write_config(aws_env, secure=True)
+    fake_keyring = _FakeKeyring()
+    called: list[str] = []
+
+    def fake_device_login(session_name, sso_config, cache) -> None:
+        called.append(session_name)
+        cache[keychain._cache_key(session_name)] = {
+            'accessToken': 'fresh-tok',
+            'expiresAt': (datetime.now(UTC) + timedelta(hours=8)).isoformat(),
+        }
+
+    monkeypatch.setattr(keychain, '_device_login', fake_device_login)
+    token = keychain._ensure_secure_token(_PROFILE, _SESSION, _SSO_CONFIG_FOR_TOKEN, fake_keyring)
+
+    assert called == [_SESSION]
+    assert token == 'fresh-tok'
+    assert 'no valid keychain token' in capsys.readouterr().err
+
+
+def test_ensure_secure_token_exits_when_still_unresolvable_after_login(aws_env, monkeypatch):
+    _write_config(aws_env, secure=True)
+    fake_keyring = _FakeKeyring()
+    monkeypatch.setattr(keychain, '_device_login', lambda *a, **k: None)  # a login that never stores a token
+
+    with pytest.raises(SystemExit, match='could not obtain a valid SSO token'):
+        keychain._ensure_secure_token(_PROFILE, _SESSION, _SSO_CONFIG_FOR_TOKEN, fake_keyring)
+
+
+def test_cmd_secure_add_writes_secure_shape_without_activating_sso_credential_provider(aws_env, monkeypatch):
+    """Same load-bearing invariant as test_secured_profile_deactivates_sso_credential_provider, plus the new
+    profile must mirror a sibling's region/output rather than falling back to the sso-session's own region."""
+    from botocore.credentials import ProfileProviderBuilder
+
+    aws_env.write_text(
+        '\n'.join([
+            '[sso-session corp]',
+            'sso_start_url = https://corp.awsapps.com/start',
+            'sso_region = us-east-1',
+            '',
+            '[profile corp-prod]',
+            'sso_session = corp',
+            'region = eu-west-1',
+            'output = yaml',
+            'brolly_sso_account_id = 222222222222',
+            'brolly_sso_role_name = AdministratorAccess',
+            'credential_process = brolly credential-process --profile corp-prod',
+            '',
+        ])
+    )
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(_live_blob()))
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake_keyring)
+    monkeypatch.setattr(keychain, '_backend_label', lambda _: 'fake')
+    new_account = {'accountId': '333333333333', 'accountName': 'corp-dev'}
+    monkeypatch.setattr(keychain, '_pick_account_role', lambda *a, **k: (new_account, 'ReadOnly'))
+
+    full_config = botocore.session.Session().full_config
+    keychain.cmd_secure_add(_SESSION, 'corp-dev', full_config)
+
+    cfg = botocore.session.Session(profile='corp-dev').get_scoped_config()
+    assert cfg['sso_session'] == _SESSION
+    assert cfg['region'] == 'eu-west-1'  # mirrors the sibling, not the sso-session's own region
+    assert cfg['output'] == 'yaml'
+    assert cfg['credential_process'] == 'brolly credential-process --profile corp-dev'
+    assert cfg['brolly_sso_account_id'] == '333333333333'
+    assert cfg['brolly_sso_role_name'] == 'ReadOnly'
+    assert 'sso_account_id' not in cfg  # never even briefly activates the SSO credential provider
+    assert 'sso_role_name' not in cfg
+
+    builder = ProfileProviderBuilder(botocore.session.Session(profile='corp-dev'))
+    assert builder._create_sso_provider('corp-dev').load() is None
+
+
+def test_cmd_secure_add_purges_a_planted_plaintext_token(aws_env, monkeypatch, capsys):
+    _write_config(aws_env, secure=True)  # corp-prod already secure; corp-dev is the new profile
+    plaintext = keychain._plaintext_token_path(_SESSION)
+    plaintext.parent.mkdir(parents=True)
+    plaintext.write_text('{"accessToken": "stale"}')
+
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(_live_blob()))
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake_keyring)
+    monkeypatch.setattr(keychain, '_backend_label', lambda _: 'fake')
+    new_account = {'accountId': '333333333333', 'accountName': 'corp-dev'}
+    monkeypatch.setattr(keychain, '_pick_account_role', lambda *a, **k: (new_account, 'ReadOnly'))
+
+    full_config = botocore.session.Session().full_config
+    keychain.cmd_secure_add(_SESSION, 'corp-dev', full_config)
+
+    assert not plaintext.is_file()
+    assert f"removed plaintext token cache for session '{_SESSION}'" in capsys.readouterr().err

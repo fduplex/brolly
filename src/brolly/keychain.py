@@ -41,9 +41,16 @@ from .cli import (
     RoleName,
     SessionName,
     _aws,
+    _aws_dir,
+    _config_path,
+    _create_profile_skeleton,
     _is_secure,
     _pick_account_role,
+    _read_config,
+    _record_secured_session,
+    _report_added,
     _session_profiles,
+    _write_config,
 )
 
 type TokenBlob = dict[str, Any]
@@ -79,27 +86,6 @@ _BACKEND_LABELS = {
     'keyring_pass': 'pass (gpg-agent)',
     'keyrings.alt.file': 'encrypted file (keyrings.alt)',
 }
-
-
-def _config_path() -> Path:
-    """brolly's own config, co-located with the expiry sidecars under ``<aws-config-dir>/brolly/``."""
-    return _aws_dir() / 'brolly' / 'config.json'
-
-
-def _read_config() -> dict[str, Any]:
-    path = _config_path()
-    if not path.is_file():
-        return {}
-    try:
-        return json.loads(path.read_text())
-    except OSError, ValueError:
-        return {}
-
-
-def _write_config(data: dict[str, Any]) -> None:
-    path = _config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + '\n')
 
 
 def _import_keyring() -> ModuleType:
@@ -173,12 +159,6 @@ def _cache_key(session_name: SessionName) -> str:
     return sha1(session_name.encode('utf-8')).hexdigest()
 
 
-def _aws_dir() -> Path:
-    """The ``.aws`` directory, honoring ``AWS_CONFIG_FILE`` so tests and non-standard layouts resolve correctly."""
-    cfg = os.environ.get('AWS_CONFIG_FILE')
-    return Path(cfg).parent if cfg else Path.home() / '.aws'
-
-
 def _iso(value: object) -> str:
     return value.isoformat() if isinstance(value, datetime) else str(value)
 
@@ -216,9 +196,57 @@ def _plaintext_token_path(session_name: SessionName) -> Path:
 def _remove_plaintext_token(session_name: SessionName) -> bool:
     """Delete the now-redundant plaintext SSO token (it lives in the keychain now). True if a file was removed."""
     path = _plaintext_token_path(session_name)
-    existed = path.is_file()
-    path.unlink(missing_ok=True)
-    return existed
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as x:
+        # a token we cannot delete must still not break the command that noticed it — report and carry on
+        print(f'! could not remove the plaintext token cache {path}: {x}', file=sys.stderr)
+        return False
+    return True
+
+
+def _purge_plaintext_token(session_name: SessionName) -> None:
+    """Drop any plaintext blob for a secured session, saying so — silence would hide that a token was on disk.
+
+    Unconditional, and only two callers may be: a completed device login and `secure enable`, both of which have
+    just put a fresh token in the keychain — and enable converts every profile that was reading the file in the
+    same run. Everything else goes through ``purge_session_plaintext``, which first checks nothing still needs it.
+    """
+    if _remove_plaintext_token(session_name):
+        print(f"✓ removed plaintext token cache for session '{session_name}'", file=sys.stderr)
+
+
+def _stock_profiles(session_name: SessionName, full_config: AwsConfig) -> list[ProfileName]:
+    """Profiles under the session still carrying both stock SSO keys — botocore resolves those from the plaintext
+    blob, and they are exactly the set ``cmd_secure_enable`` converts, so what it fixes is what this reports."""
+    return sorted(
+        p for p, c in _session_profiles(session_name, full_config) if c.get('sso_account_id') and c.get('sso_role_name')
+    )
+
+
+def purge_session_plaintext(session_name: SessionName, full_config: AwsConfig | None = None) -> None:
+    """Clear a secured session's plaintext token whether or not this command authenticated — ``cli`` runs this from
+    the one place that decides a session is secure, so no command can forget it.
+
+    One exception, stated rather than silent: while a stock profile is still configured under the session, botocore
+    resolves *its* credentials out of this very blob, and deleting it would break a working profile with nothing
+    but a browser login to get it back. That case is reported and left alone; `secure enable` is the command that
+    converts those profiles and clears the file in one go.
+    """
+    if not _plaintext_token_path(session_name).is_file():
+        return  # the common case, and the only cost on it: one stat
+    stock = _stock_profiles(session_name, full_config or botocore.session.Session().full_config)
+    if stock:
+        print(
+            f"! session '{session_name}' is secured, but ~/.aws/sso/cache still holds its token — "
+            f'{", ".join(stock)} still resolves credentials from it, so this command left it alone.\n'
+            f'  Convert it and clear the file:  brolly secure enable -s {session_name}',
+            file=sys.stderr,
+        )
+        return
+    _purge_plaintext_token(session_name)
 
 
 @contextmanager
@@ -379,6 +407,7 @@ def _device_login(session_name: SessionName, sso_config: AwsConfig, cache: _Keyc
         blob['refreshToken'] = token['refreshToken']
     cache[_cache_key(session_name)] = blob
     print('✓ authorized — SSO token stored in your OS keychain', file=sys.stderr)
+    _purge_plaintext_token(session_name)
     if 'refreshToken' not in blob:
         print(
             f'! IAM Identity Center issued no refresh token for this session, so it cannot renew silently — '
@@ -406,6 +435,22 @@ def load_secure_token(
     return frozen.token
 
 
+def _ensure_secure_token(
+    profile: ProfileName, session_name: SessionName, full_config: AwsConfig, keyring_module: ModuleType
+) -> AccessToken:
+    """The secure-mode counterpart of ``cli._ensure_token``: a live keychain token, device login only if needed."""
+    token = load_secure_token(profile, session_name, keyring_module)
+    if token is not None:
+        return token
+    print(f"SSO session '{session_name}' has no valid keychain token — logging in…", file=sys.stderr)
+    cache = _KeychainTokenCache(keyring_module, session_name)
+    _device_login(session_name, full_config['sso_sessions'][session_name], cache)
+    token = load_secure_token(profile, session_name, keyring_module)
+    if token is None:
+        raise SystemExit('could not obtain a valid SSO token after login')
+    return token
+
+
 def cmd_credential_process(profile: ProfileName) -> None:
     """Machine-facing: emit the ``Version: 1`` credential JSON the AWS SDK/CLI expect for ``credential_process``."""
     session = botocore.session.Session(profile=profile)
@@ -418,15 +463,20 @@ def cmd_credential_process(profile: ProfileName) -> None:
     role: RoleName | None = cfg.get('brolly_sso_role_name')
     if not (session_name and account_id and role):
         raise SystemExit(f"profile '{profile}' is not a brolly secure profile — run: brolly secure enable")
-    sso_sessions = session.full_config.get('sso_sessions', {})
+    full_config = session.full_config
+    sso_sessions = full_config.get('sso_sessions', {})
     if session_name not in sso_sessions:
         raise SystemExit(f"sso-session '{session_name}' referenced by '{profile}' is not defined")
     sso_region: Region = sso_sessions[session_name]['sso_region']
+    # One stat on the common path (the file is normally absent), and everything it may print goes to stderr —
+    # stdout belongs to the credential JSON. Worth it: this runs on every cold resolution, so it is the path most
+    # likely to be the first to notice a blob that some other tool wrote back into the cache.
+    purge_session_plaintext(session_name, full_config)
 
     keyring_module = _configured_keyring()
     access_token = load_secure_token(profile, session_name, keyring_module)
     if access_token is None:
-        raise SystemExit(f"no valid token for session '{session_name}' — run: brolly secure login -s {session_name}")
+        raise SystemExit(f"no valid token for session '{session_name}' — run: brolly login -s {session_name}")
 
     sso = boto3.client('sso', region_name=sso_region, config=Config(signature_version=UNSIGNED))
     try:
@@ -434,9 +484,7 @@ def cmd_credential_process(profile: ProfileName) -> None:
             'roleCredentials'
         ]
     except sso.exceptions.UnauthorizedException:
-        raise SystemExit(
-            f"token rejected for session '{session_name}' — run: brolly secure login -s {session_name}"
-        ) from None
+        raise SystemExit(f"token rejected for session '{session_name}' — run: brolly login -s {session_name}") from None
 
     # The credential_process contract *is* to write the credentials as JSON on stdout, which the calling SDK
     # reads back over a pipe — this is the protocol's designed channel, not a log sink. Static analysis flags it
@@ -480,18 +528,36 @@ def cmd_secure_enable(session_name: SessionName, full_config: AwsConfig, backend
         print(f"→ stored token for '{session_name}' cannot renew silently — re-authorizing", file=sys.stderr)
         _device_login(session_name, sso_config, cache)
 
-    # The token is safely in the keychain now — drop the redundant plaintext copy botocore/aws-cli left behind.
-    if _remove_plaintext_token(session_name):
-        print(f"✓ removed plaintext token cache for session '{session_name}'", file=sys.stderr)
+    # Recorded before the profiles are touched: the session is secured the moment its token is in the keychain,
+    # and a run that dies half-way through the rewrite below must still leave it detectable as such.
+    _record_secured_session(session_name, True)
 
-    secured = 0
+    # The token is safely in the keychain now — drop the redundant plaintext copy botocore/aws-cli left behind.
+    # Unconditional here, unlike purge_session_plaintext: the loop below converts every profile that was reading it.
+    _purge_plaintext_token(session_name)
+
+    converted, already, skeletons = 0, 0, []
     for profile, cfg in _session_profiles(session_name, full_config):
+        if _is_secure(cfg):
+            already += 1
+            continue
         account_id, role = cfg.get('sso_account_id'), cfg.get('sso_role_name')
         if not (account_id and role):
-            continue  # already secured (account/role moved to brolly_sso_*) or an incomplete skeleton
+            skeletons.append(profile)  # an incomplete profile — nothing to move into brolly_sso_*
+            continue
         _secure_profile(profile, account_id, role, cfg.get('sso_account_name'))
-        secured += 1
-    print(f"✓ secure mode on for session '{session_name}' — {secured} profile(s) now use the OS keychain")
+        converted += 1
+
+    print(f"✓ secure mode on for session '{session_name}' — its token now lives in the OS keychain")
+    if converted or already:
+        print(f'  {converted + already} profile(s) resolve credentials through it ({converted} converted just now)')
+    if skeletons:
+        print(
+            f'  no account/role set yet, so left alone: {", ".join(skeletons)}\n'
+            f'  finish one with `AWS_PROFILE=<profile> brolly switch` — it will be written in secure shape'
+        )
+    elif not (converted or already):
+        print(f'  it has no profiles yet — `brolly add <profile> -s {session_name}` creates one already secured')
 
 
 def cmd_secure_disable(session_name: SessionName, full_config: AwsConfig) -> None:
@@ -508,11 +574,12 @@ def cmd_secure_disable(session_name: SessionName, full_config: AwsConfig) -> Non
 
     with suppress(KeyError):
         del _KeychainTokenCache(keyring_module, session_name)[_cache_key(session_name)]
+    _record_secured_session(session_name, False)
     print(f"✓ secure mode off for session '{session_name}' — {reverted} profile(s) back to the stock cache")
 
 
 def cmd_secure_login(session_name: SessionName, full_config: AwsConfig) -> None:
-    """Re-run the device login for a secured session, refreshing the keychain token in place."""
+    """`brolly login` for a secured session: re-run the device login, refreshing the keychain token in place."""
     keyring_module = _configured_keyring()
     print(f'→ keychain backend: {_backend_label(keyring_module)}', file=sys.stderr)
     sso_config = full_config['sso_sessions'][session_name]
@@ -527,14 +594,25 @@ def cmd_secure_switch(profile: ProfileName, full_config: AwsConfig) -> None:
     sso_region: Region = full_config['sso_sessions'][session_name]['sso_region']
 
     keyring_module = _configured_keyring()
-    token = load_secure_token(profile, session_name, keyring_module)
-    if token is None:
-        raise SystemExit(
-            f"session '{session_name}' has no valid keychain token — run: brolly secure login -s {session_name}"
-        )
-
+    token = _ensure_secure_token(profile, session_name, full_config, keyring_module)
     account, role = _pick_account_role(
         sso_region, token, cfg.get('brolly_sso_account_id'), cfg.get('brolly_sso_role_name')
     )
     _secure_profile(profile, account['accountId'], role, account['accountName'])
     print(f'✓  {profile} → {account["accountId"]} ({account["accountName"]}) / {role}')
+
+
+def cmd_secure_add(session_name: SessionName, new_profile: ProfileName, full_config: AwsConfig) -> None:
+    """`brolly add` for a secured session: create the profile already in secure shape.
+
+    It never writes the standard ``sso_account_id``/``sso_role_name`` keys, not even briefly — they would activate
+    botocore's SSO credential provider ahead of ``credential_process`` (see the module docstring).
+    """
+    sso_region = _create_profile_skeleton(session_name, new_profile, full_config)
+    keyring_module = _configured_keyring()
+    print(f'→ keychain backend: {_backend_label(keyring_module)}', file=sys.stderr)
+    token = _ensure_secure_token(new_profile, session_name, full_config, keyring_module)
+    purge_session_plaintext(session_name, full_config)
+    account, role = _pick_account_role(sso_region, token)
+    _secure_profile(new_profile, account['accountId'], role, account['accountName'])
+    _report_added(new_profile, account, role)
