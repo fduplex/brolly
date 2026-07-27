@@ -94,10 +94,14 @@ _GREEN = '\033[32m'
 _RED = '\033[31m'
 
 # `ls` status -> (colour, glyph); palette kept in step with the ps1 pill's live/idle/gone/plain states so the
-# two surfaces read as one tool.
+# two surfaces read as one tool. `stock` is `ls`'s own fifth state and has no pill counterpart: the pill reads one
+# profile's store, while this is a fact about a whole session mid-migration (see `_awaiting_migration`). It takes
+# the orange every other "works, but wants attention" state here takes, and the lock glyph because the session
+# really is secured \u2014 it is only its token that has not moved yet.
 _STATUS_STYLES: dict[State, tuple[str, str]] = {
     'live': (_GREEN, _CHECK),
     'idle': (_ORANGE, _CLOCK),
+    'stock': (_ORANGE, _LOCK),
     'gone': (_RED, _CROSS),
     'plain': (_DIM, '\u00b7'),
 }
@@ -130,23 +134,49 @@ def _aws_dir() -> Path:
     return Path(cfg).parent if cfg else Path.home() / '.aws'
 
 
+# brolly's own directory and the files in it. Nothing they hold is secret — a session name, an ISO expiry, a
+# boolean, a keyring backend path — so this is not protecting a credential. It is refusing to be the loose file in
+# the room: brolly's whole point next door is that ~/.aws/sso/cache is a 0600 file botocore keeps private, and a
+# 0755 directory of 0644 files sitting beside it is a downgrade nobody chose. Files brolly does not own —
+# ~/.aws/config above all, which is the AWS CLI's — keep whatever mode the user gave them.
+_BROLLY_DIR_MODE = 0o700
+_BROLLY_FILE_MODE = 0o600
+
+
+def _brolly_dir() -> Path:
+    """brolly's own directory: its config and the expiry sidecars, under ``<aws-config-dir>/brolly/``."""
+    return _aws_dir() / 'brolly'
+
+
+def _ensure_brolly_dir() -> Path:
+    """Create brolly's own directory, and tighten one an earlier brolly (or a loose umask) left group-readable."""
+    path = _brolly_dir()
+    path.mkdir(parents=True, exist_ok=True, mode=_BROLLY_DIR_MODE)
+    path.chmod(_BROLLY_DIR_MODE)
+    return path
+
+
 def _config_path() -> Path:
     """brolly's own config, co-located with the expiry sidecars under ``<aws-config-dir>/brolly/``."""
-    return _aws_dir() / 'brolly' / 'config.json'
+    return _brolly_dir() / 'config.json'
 
 
 def _atomic_write(path: Path, text: str) -> None:
     """Replace a file's contents in one step — an interrupted write leaves the old file, never a truncated one.
 
     The temp file is created in the target's own directory so ``os.replace`` is a rename within one filesystem, and
-    an existing file's mode is carried over so rewriting ~/.aws/config never narrows it to the temp file's 0600.
+    the mode it lands on follows who owns the file. One of brolly's own ends up at ``_BROLLY_FILE_MODE`` however
+    loose it was before, which is how a file an older brolly wrote 0644 gets tightened rather than preserved;
+    anything else keeps its existing mode, so rewriting ~/.aws/config never narrows it to the temp file's 0600.
     """
     fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f'.{path.name}.', suffix='.tmp')
     temp = Path(temp_name)
     try:
         with os.fdopen(fd, 'w') as handle:
             handle.write(text)
-        if path.exists():
+        if path.parent == _brolly_dir():
+            temp.chmod(_BROLLY_FILE_MODE)  # what mkstemp already gives it, stated rather than relied on
+        elif path.exists():
             shutil.copymode(path, temp)
         os.replace(temp, path)
     except BaseException:
@@ -177,9 +207,8 @@ def _read_config() -> dict[str, Any]:
 
 
 def _write_config(data: dict[str, Any]) -> None:
-    path = _config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(path, json.dumps(data, indent=2) + '\n')
+    _ensure_brolly_dir()
+    _atomic_write(_config_path(), json.dumps(data, indent=2) + '\n')
 
 
 def _secured_sessions() -> set[SessionName]:
@@ -609,6 +638,8 @@ def _status_detail(state: State, expiry: datetime | None) -> str:
     """The expiry colspan only — the state word itself now lives in the `status` column, so it is not repeated here."""
     if state == 'gone':
         return 'no valid token'
+    if state == 'stock':
+        return 'secured, not migrated yet — its profiles still resolve from the plaintext token'
     if expiry is None:
         return ''
     verb = 'expires' if expiry > datetime.now(UTC) else 'expired'
@@ -644,6 +675,23 @@ def _probe_session(
         return None
 
 
+def _awaiting_migration(session_name: SessionName, full_config: AwsConfig, leftovers: Any, keychain_mod: Any) -> bool:
+    """True when a secured session's credentials have simply not moved yet — the state `ls` must not call 'gone'.
+
+    Nothing in the keychain and no sidecar reads as 'gone' locally, and that is the truth only once the session has
+    actually migrated. While its profiles still carry the stock ``sso_account_id``/``sso_role_name`` pair *and* its
+    token blob is still in ~/.aws/sso/cache, those profiles are resolving credentials out of it perfectly well —
+    the session is secured, but nothing has moved. `ls` is the one command that never heals, so it is the one most
+    likely to be run in exactly this state, and 'no valid token' is the opposite of what is true.
+
+    Both halves are required. Stock profiles with no blob resolve nothing, and a migrated session whose blob merely
+    lingers is genuinely gone: neither is a migration waiting to finish, and both really are 'gone'.
+    """
+    if keychain_mod is None or leftovers is None or leftovers.token is None:
+        return False
+    return bool(keychain_mod._stock_profiles(session_name, full_config))
+
+
 class _Block(NamedTuple):
     """One session's resolved `ls` state — everything the table needs about it, sized and printed in one pass."""
 
@@ -651,7 +699,10 @@ class _Block(NamedTuple):
     state: State
     expiry: datetime | None
     refreshable: bool | None
-    leaked: bool  # secured, yet a plaintext token blob is still sitting in ~/.aws/sso/cache
+    # secured, yet ~/.aws/sso/cache still holds something of this session's: how to name it, or None when it holds
+    # nothing. A phrase rather than a flag because a leftover is not always a token — an orphaned OIDC client
+    # registration is a client secret with its own ~90-day life, and calling it a token sends the reader elsewhere.
+    leaked: str | None
     rows: list[ProfileRow]
 
 
@@ -734,13 +785,17 @@ def cmd_ls(full_config: AwsConfig, current: ProfileName | None, check: bool) -> 
     secured = {s for s in sso_sessions if _session_is_secure(s, full_config)}
 
     keychain_mod = keyring_module = None
-    if check and secured:
+    if secured:
+        # Two read-only things `ls` wants from the keychain module: what a secured session has left in
+        # ~/.aws/sso/cache (always), and a backend to probe it with (under --check). Neither may bring `ls` down,
+        # and a backend that will not resolve still leaves the module itself perfectly able to answer the first.
         try:
             from brolly import keychain
 
-            keychain_mod, keyring_module = keychain, keychain._configured_keyring()
+            keychain_mod = keychain
+            keyring_module = keychain._configured_keyring() if check else None
         except Exception, SystemExit:
-            keychain_mod = keyring_module = None
+            keyring_module = None
 
     # First pass: resolve every session's status and its profile rows so the profile columns can be sized once
     # across all sessions — the table stays aligned across session breaks instead of per-session.
@@ -750,10 +805,18 @@ def cmd_ls(full_config: AwsConfig, current: ProfileName | None, check: bool) -> 
         secure = session_name in secured
         sso_region: Region = sso_sessions[session_name].get('sso_region', '')
         path = _expiry_path(session_name, config, secure)
-        # `ls` reports; it never mutates. A leftover plaintext blob under a secured session is stated here and
-        # cleared by the commands that do act (see keychain.purge_session_plaintext).
-        leaked = secure and _expiry_path(session_name, config, False).is_file()
+        # `ls` reports; it never mutates. Whatever a secured session has left in ~/.aws/sso/cache is stated here and
+        # cleared by the commands that do act — through the same attribution they purge by, so `ls` never names a
+        # file they would not touch, and never a stranger's client registration as this session's.
+        leftovers = (
+            keychain_mod._plaintext_leftovers(session_name, sso_sessions[session_name])
+            if secure and keychain_mod is not None
+            else None
+        )
+        leaked = leftovers.phrase if leftovers is not None and leftovers.paths else None
         state, expiry = _state_for(path), _read_expiry(path)
+        if state == 'gone' and _awaiting_migration(session_name, full_config, leftovers, keychain_mod):
+            state = 'stock'
         if check and state == 'idle' and members:
             probed = _probe_session(session_name, members[0][0], secure, keychain_mod, keyring_module)
             if probed is not None:
@@ -796,8 +859,8 @@ def cmd_ls(full_config: AwsConfig, current: ProfileName | None, check: bool) -> 
         print(line)
         if block.leaked:
             warning = (
-                f"! ~/.aws/sso/cache still holds this session's token — "
-                f'`brolly secure enable -s {block.session}` removes it'
+                f'! ~/.aws/sso/cache still holds {block.leaked} — the next brolly command using this session '
+                f'clears it, or `brolly secure enable -s {block.session}` now'
             )
             print(f'{" " * profile_col}{_color(warning, _ORANGE, tty)}')
         _print_profiles(block.rows, current, widths, profile_col, tty)

@@ -214,12 +214,83 @@ def _stored_blob(keyring_module: _FakeKeyring, session_name: str = _SESSION) -> 
     return json.loads(raw)
 
 
-def _plant_plaintext_token(session_name: str = _SESSION):
-    """A stale plaintext SSO blob at botocore's fixed cache path — HOME is tmp_path-isolated for every test here."""
+def _plant_plaintext_token(session_name: str = _SESSION, client_id: str | None = None):
+    """A stale plaintext SSO blob at botocore's fixed cache path — HOME is tmp_path-isolated for every test here.
+
+    ``client_id`` writes every key `aws sso login` really writes, including the registration the token was minted
+    under ("Cache the registration alongside the token" — botocore/tokens.py). That copy is what lets a purge say
+    which registration file in the directory is this session's — and the full key set is what makes a token blob a
+    fair test of everything that must not mistake one for a registration: it carries clientId, clientSecret and
+    expiresAt too, so only the accessToken tells them apart.
+    """
     path = keychain._plaintext_token_path(session_name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('{"accessToken": "stale", "refreshToken": "leaked"}')
+    blob = {'accessToken': 'stale', 'refreshToken': 'leaked'}
+    if client_id is not None:
+        blob |= {
+            'startUrl': 'https://corp.awsapps.com/start',
+            'region': 'us-east-1',
+            'expiresAt': (datetime.now(UTC) + timedelta(hours=8)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'clientId': client_id,
+            'clientSecret': 'client-secret',
+            'registrationExpiresAt': '2099-01-01T00:00:00Z',
+        }
+    path.write_text(json.dumps(blob))
     return path
+
+
+def _aws_cli_registration_key(session_name: str = _SESSION, sso_config: dict | None = None) -> str:
+    """The name the AWS CLI gives a session's client-registration blob, derived here rather than asked of brolly.
+
+    Verbatim from awscli/botocore/utils.py, ``BaseSSOTokenFetcher._registration_cache_key``::
+
+        args = {
+            'tool': 'botocore',
+            'startUrl': start_url,
+            'region': self._sso_region,
+            'scopes': scopes,
+            'session_name': session_name,
+        }
+        return hashlib.sha1(json.dumps(args, sort_keys=True).encode('utf-8')).hexdigest()
+
+    The whole point of that route is parity with somebody else's naming, so a test that called
+    ``keychain._registration_cache_key`` for the expected name would only prove brolly agrees with itself.
+    """
+    config = sso_config if sso_config is not None else _SSO_CONFIG
+    raw_scopes = config.get('sso_registration_scopes')
+    args = {
+        'tool': 'botocore',
+        'startUrl': config['sso_start_url'],
+        'region': config['sso_region'],
+        'scopes': None if raw_scopes is None else [s.strip() for s in raw_scopes.split(',') if s.strip()],
+        'session_name': session_name,
+    }
+    return sha1(json.dumps(args, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+_OTHER_SESSION = 'other-corp'
+_UNRELATED_NAME = '0' * 40  # a cache-key-shaped name that is *not* the one the AWS CLI derives for this session
+
+
+def _plant_registration(name: str, client_id: str, **extra: object):
+    """A client-registration blob exactly as `aws sso login` writes one: a clientId, a client secret with a ~90-day
+    life, an expiry — and nothing whatsoever naming the session, start URL or region it belongs to."""
+    path = keychain._sso_cache_dir() / f'{name}.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    expires = (datetime.now(UTC) + timedelta(days=90)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    path.write_text(
+        json.dumps({'clientId': client_id, 'clientSecret': 'registration-secret', 'expiresAt': expires} | extra)
+    )
+    return path
+
+
+def _secure_session_config() -> dict:
+    """The in-memory config a purge sees under a healthy secured session: one converted profile holding nothing
+    back, and the sso-session block the reproducible registration name is derived from."""
+    return {
+        'profiles': {_PROFILE: {'sso_session': _SESSION, 'brolly_sso_account_id': _ACCOUNT}},
+        'sso_sessions': {_SESSION: _SSO_CONFIG},
+    }
 
 
 def _stub_keyring_backend(monkeypatch, keyring_module: _FakeKeyring) -> None:
@@ -847,6 +918,157 @@ def test_secure_enable_leaves_the_plaintext_blob_untouched_when_a_shadowed_heade
     assert 'deliberately left' in err
 
 
+_FOREIGN = 'corp-foreign'
+_FOREIGN_PROCESS = '/opt/acme/aws-credentials.sh --role reader'
+
+
+def _write_foreign_credential_process_config(path) -> None:
+    """A secured session with two stock profiles: `corp-legacy` clean, `corp-foreign` already carrying a credential
+    helper of the user's own. Converting the one and refusing the other is the whole of the case."""
+    path.write_text(
+        '\n'.join([
+            '[sso-session corp]',
+            'sso_start_url = https://corp.awsapps.com/start',
+            'sso_region = us-east-1',
+            '',
+            f'[profile {_STOCK}]',
+            'sso_session = corp',
+            'sso_account_id = 333333333333',
+            'sso_role_name = ReadOnly',
+            '',
+            f'[profile {_FOREIGN}]',
+            'sso_session = corp',
+            'sso_account_id = 444444444444',
+            'sso_role_name = ReadOnly',
+            f'credential_process = {_FOREIGN_PROCESS}',
+        ])
+        + '\n'
+    )
+
+
+def test_secure_enable_refuses_to_overwrite_a_credential_process_brolly_did_not_write(aws_env, monkeypatch, capsys):
+    """Secure mode needs ``credential_process`` for itself, but a user's own credential helper is not brolly's to
+    destroy — and it used to be overwritten silently, with nothing left on disk to restore it from. A foreign value
+    is a conflict: the profile is left exactly as it is, named with its command, and the session's plaintext token
+    stays put because a profile that did not convert is still resolving out of it. The pass goes on: the other
+    stock profile under the session is converted in the same run."""
+    _write_foreign_credential_process_config(aws_env)
+    plaintext = _plant_plaintext_token()
+    stale_bytes = plaintext.read_bytes()
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password(
+        'brolly-sso', keychain._cache_key(_SESSION), json.dumps({**_live_blob(), 'refreshToken': 'good'})
+    )
+    _stub_keyring_backend(monkeypatch, fake_keyring)
+
+    with pytest.raises(SystemExit) as exc_info:
+        keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    assert exc_info.value.code == 1
+    foreign = botocore.session.Session(profile=_FOREIGN).get_scoped_config()
+    assert foreign['credential_process'] == _FOREIGN_PROCESS  # untouched, and still the profile's own helper
+    assert foreign['sso_account_id'] == '444444444444'  # not converted: nothing was written at all
+    assert 'brolly_sso_account_id' not in foreign
+    converted = botocore.session.Session(profile=_STOCK).get_scoped_config()
+    assert converted['brolly_sso_account_id'] == '333333333333'  # the run continued past the conflict
+    assert converted['credential_process'] == f'brolly credential-process --profile {_STOCK}'
+    assert plaintext.read_bytes() == stale_bytes  # a profile that did not convert holds the purge back
+    captured = capsys.readouterr()
+    assert _FOREIGN in captured.err
+    assert _FOREIGN_PROCESS in captured.err  # names the value, so the user can see what would have been destroyed
+    assert f'could not convert, so still resolving from ~/.aws/sso/cache: {_FOREIGN}' in captured.out
+
+
+def test_secure_profile_treats_brollys_own_credential_process_as_ours_and_not_a_conflict(aws_env, capsys):
+    """The other half of the rule, and the one that keeps every secure command idempotent: what a converted profile
+    carries is brolly's own ``credential-process`` line, so re-running over it must convert, not conflict."""
+    _write_config(aws_env, secure=True)
+    aws_env.write_text(aws_env.read_text() + 'sso_account_id = 555555555555\nsso_role_name = ReadOnly\n')
+
+    assert keychain._secure_profile(_PROFILE, '555555555555', 'ReadOnly', None) is True
+
+    cfg = botocore.session.Session(profile=_PROFILE).get_scoped_config()
+    assert cfg['credential_process'] == f'brolly credential-process --profile {_PROFILE}'
+    assert cfg['brolly_sso_account_id'] == '555555555555'
+    assert 'conflict' not in capsys.readouterr().err
+
+
+def test_secure_switch_fails_loudly_rather_than_claiming_a_profile_it_could_not_write(aws_env, monkeypatch, capsys):
+    """`switch` ends in a ✓ line naming an account and role. When ``_secure_profile`` refuses the write — here on a
+    hand-edited profile whose credential_process is somebody else's — that line would be a claim about a profile
+    that was never touched, and whatever ran the command would take it for a working secure profile."""
+    aws_env.write_text(
+        '\n'.join([
+            '[sso-session corp]',
+            'sso_start_url = https://corp.awsapps.com/start',
+            'sso_region = us-east-1',
+            '',
+            f'[profile {_PROFILE}]',
+            'sso_session = corp',
+            'brolly_sso_account_id = 222222222222',
+            'brolly_sso_role_name = AdministratorAccess',
+            f'credential_process = {_FOREIGN_PROCESS}',
+        ])
+        + '\n'
+    )
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(_live_blob()))
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake_keyring)
+    monkeypatch.setattr(keychain, '_pick_account_role', lambda *a, **k: ({'accountId': '999', 'accountName': 'x'}, 'R'))
+
+    with pytest.raises(SystemExit) as exc_info:
+        keychain.cmd_secure_switch(_PROFILE, botocore.session.Session().full_config)
+
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert f'{_PROFILE} → ' not in captured.out  # no ✓ line for a write that was refused
+    assert _FOREIGN_PROCESS in captured.err
+    assert botocore.session.Session(profile=_PROFILE).get_scoped_config()['credential_process'] == _FOREIGN_PROCESS
+
+
+def test_secure_add_fails_loudly_rather_than_claiming_a_profile_it_could_not_write(aws_env, monkeypatch, capsys):
+    """`add`'s twin of the same false success. It ends in an "added" line naming an account and role, and when
+    ``_secure_profile`` refuses the write that line describes a profile which resolves credentials from nowhere:
+    no ``credential_process``, no ``brolly_sso_*``, and under a secured session no plaintext token either.
+
+    Why the refusal is stubbed rather than staged: what makes ``_secure_profile`` say no — a foreign
+    ``credential_process``, a rewrite it reads back as not having landed — has its own tests either side of this
+    one. The bug here was never in the answer; it was that `add` did not look at it."""
+    _write_config(aws_env, secure=True)  # corp-prod already secure; corp-dev is the new profile
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(_live_blob()))
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake_keyring)
+    monkeypatch.setattr(keychain, '_backend_label', lambda _: 'fake')
+    new_account = {'accountId': '333333333333', 'accountName': 'corp-dev'}
+    monkeypatch.setattr(keychain, '_pick_account_role', lambda *a, **k: (new_account, 'ReadOnly'))
+    monkeypatch.setattr(keychain, '_secure_profile', lambda *a, **k: False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        keychain.cmd_secure_add(_SESSION, 'corp-dev', botocore.session.Session().full_config)
+
+    assert exc_info.value.code == 1
+    assert 'added corp-dev' not in capsys.readouterr().out  # no ✓ line for a profile that was never written
+
+
+_CREDENTIAL_PROCESS_FORMS = [
+    pytest.param('brolly credential-process --profile corp-prod', True, id='what-brolly-writes'),
+    pytest.param('/usr/local/bin/brolly credential-process --profile corp-prod', True, id='absolute-path'),
+    pytest.param('uv run brolly credential-process --profile corp-prod', True, id='through-a-runner'),
+    pytest.param('brolly credential-process --profile someone-else', True, id='brollys-own-wrong-profile'),
+    pytest.param('/opt/acme/aws-credentials.sh --role reader', False, id='another-tools-helper'),
+    pytest.param('aws configure export-credentials --profile corp-prod', False, id='the-aws-cli'),
+    pytest.param('brolly-wrapper credential-process', False, id='name-that-merely-starts-with-brolly'),
+    pytest.param('sh -c "unbalanced', False, id='unparseable'),
+]
+
+
+@pytest.mark.parametrize('command, ours', _CREDENTIAL_PROCESS_FORMS)
+def test_brolly_recognizes_its_own_credential_process_however_it_is_spelled(command, ours):
+    """Where the line between idempotent and conflict actually falls. Too strict and brolly declares a conflict
+    over its own helper spelled with a path; too loose and it overwrites somebody else's."""
+    assert keychain._is_brolly_credential_process(command) is ours
+
+
 def test_secure_enable_and_healing_share_one_pass_over_the_profiles(aws_env, monkeypatch, capsys):
     """`secure enable` converts up front what healing converts on upgrade — one helper, so they cannot disagree."""
     _write_mixed_config(aws_env, skeleton=True)
@@ -1162,7 +1384,7 @@ def test_purge_plaintext_token_removes_a_planted_file_and_reports_it(tmp_path, m
     token = cache_dir / f'{keychain._cache_key(_SESSION)}.json'
     token.write_text('{"accessToken": "plaintext-cruft", "refreshToken": "leaked"}')
 
-    keychain._purge_plaintext_token(_SESSION)
+    keychain._purge_plaintext_token(_SESSION, _SSO_CONFIG)
 
     assert not token.exists()
     assert f"removed plaintext token cache for session '{_SESSION}'" in capsys.readouterr().err
@@ -1170,7 +1392,7 @@ def test_purge_plaintext_token_removes_a_planted_file_and_reports_it(tmp_path, m
 
 def test_purge_plaintext_token_is_silent_and_safe_when_nothing_to_remove(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv('HOME', str(tmp_path))  # no ~/.aws/sso/cache at all
-    keychain._purge_plaintext_token(_SESSION)  # must not raise
+    keychain._purge_plaintext_token(_SESSION, _SSO_CONFIG)  # must not raise
     assert capsys.readouterr().err == ''
 
 
@@ -1209,14 +1431,13 @@ def test_purge_session_plaintext_guards_the_file_while_a_stock_sibling_still_res
     assert f"session '{_SESSION}' is secured" in err
 
 
-def test_credential_process_leaves_the_blob_and_the_stock_sibling_alone(aws_env, monkeypatch, capsys):
-    """The one path the guard still fires on. `credential-process` is spawned by the SDK on every cold credential
-    resolution, non-interactively and with stdout owned by the credential JSON — it must not rewrite ~/.aws/config
-    to heal a sibling, so it reports and leaves both the profile and the blob as they are."""
+def test_credential_process_neither_heals_a_stock_sibling_nor_deletes_anything(aws_env, monkeypatch, capsys):
+    """`credential-process` is spawned by the SDK on every cold credential resolution, non-interactively and with
+    stdout owned by the credential JSON. It rewrites neither ~/.aws/config nor the filesystem: the stock sibling
+    keeps its keys and the leaked blob keeps its bytes, and the report says so."""
     _write_mixed_config(aws_env)
-    plaintext = keychain._plaintext_token_path(_SESSION)
-    plaintext.parent.mkdir(parents=True)
-    plaintext.write_text('{"accessToken": "stale", "refreshToken": "leaked"}')
+    plaintext = _plant_plaintext_token()
+    stale_bytes = plaintext.read_bytes()
 
     fake_keyring = _FakeKeyring()
     fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(_live_blob()))
@@ -1225,9 +1446,37 @@ def test_credential_process_leaves_the_blob_and_the_stock_sibling_alone(aws_env,
 
     keychain.cmd_credential_process(_PROFILE)
 
-    assert plaintext.is_file()
+    assert plaintext.read_bytes() == stale_bytes
     assert 'sso_account_id' in botocore.session.Session(profile=_STOCK).get_scoped_config()  # never healed here
-    assert _STOCK in capsys.readouterr().err
+    assert f"session '{_SESSION}' is secured" in capsys.readouterr().err
+
+
+def test_credential_process_reports_a_leaked_token_and_registration_without_removing_either(
+    aws_env, monkeypatch, capsys
+):
+    """The posture this path keeps toward the filesystem, for the same reason it already kept it toward
+    ~/.aws/config. Its guards only recognise consumers that exist as AWS profiles, so a third-party SSO helper, a
+    script or a container mount reading that blob is invisible to them — and this runs unattended, spawned by
+    whatever wanted credentials. So it names both files, deletes neither, and says the next brolly command clears
+    them. stdout stays exactly the credential JSON the calling SDK parses: one object, nothing else."""
+    _write_config(aws_env, secure=True)
+    token = _plant_plaintext_token(client_id='client-corp')
+    registration = _plant_registration(_UNRELATED_NAME, 'client-corp')
+
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(_live_blob()))
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake_keyring)
+    monkeypatch.setattr(keychain.boto3, 'client', lambda *a, **k: _FakeSso(0))
+
+    keychain.cmd_credential_process(_PROFILE)  # exits 0: no SystemExit at all
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)['Version'] == 1  # the whole of stdout parses as the one credential object
+    assert token.is_file()
+    assert registration.is_file()
+    assert 'its token and the OIDC client registration `aws sso login` cached with it' in captured.err
+    assert str(token) in captured.err and str(registration) in captured.err  # names the files, not just the fact
+    assert 'The next brolly command clears it' in captured.err  # not being ignored, just not acted on here
 
 
 def test_purge_session_plaintext_is_a_cheap_noop_when_no_plaintext_file_exists(tmp_path, monkeypatch, capsys):
@@ -1240,6 +1489,150 @@ def test_purge_session_plaintext_is_a_cheap_noop_when_no_plaintext_file_exists(t
     keychain.purge_session_plaintext(_SESSION, {'profiles': {}})  # must not raise
 
     assert capsys.readouterr().err == ''
+
+
+def test_purge_removes_the_client_registration_the_login_cached_beside_the_token(tmp_path, monkeypatch, capsys):
+    """`aws sso login` leaves two credentials in ~/.aws/sso/cache, not one: the token blob, and the OIDC client
+    registration it was minted under — a client secret with roughly a 90-day life. Secure mode leaves neither.
+
+    The registration is planted under a name brolly cannot derive, so the only thing that can have identified it is
+    the clientId the token blob carries — the route that matters in practice, since what brolly purges is a leaked
+    token blob and the blob is what names its own registration.
+    """
+    monkeypatch.setenv('HOME', str(tmp_path))
+    token = _plant_plaintext_token(client_id='client-corp')
+    registration = _plant_registration(_UNRELATED_NAME, 'client-corp')
+
+    keychain.purge_session_plaintext(_SESSION, _secure_session_config())
+
+    assert not token.exists()
+    assert not registration.exists()
+    err = capsys.readouterr().err
+    assert f"removed plaintext token cache for session '{_SESSION}'" in err
+    assert f"removed the OIDC client registration `aws sso login` cached for session '{_SESSION}'" in err
+
+
+def test_purge_removes_a_registration_under_the_name_the_aws_cli_derives_when_no_token_blob_is_left(
+    tmp_path, monkeypatch, capsys
+):
+    """The second route, and the only one left once the token blob has already gone: the AWS CLI names the file
+    ``sha1`` of a JSON object over the start URL, region, scopes and session name, all of which brolly can read
+    back out of the sso-session. A file under that exact name which reads as a registration is this session's by
+    construction — no clientId to compare it against required."""
+    monkeypatch.setenv('HOME', str(tmp_path))
+    registration = _plant_registration(_aws_cli_registration_key(), 'client-corp')
+
+    keychain.purge_session_plaintext(_SESSION, _secure_session_config())
+
+    assert not registration.exists()
+    assert (
+        f"removed the OIDC client registration `aws sso login` cached for session '{_SESSION}'"
+        in capsys.readouterr().err
+    )
+
+
+def test_purge_derives_the_registration_name_from_the_sessions_configured_scopes(tmp_path, monkeypatch):
+    """``sso_registration_scopes`` is part of what the AWS CLI hashes, and it goes in parsed — comma-split and
+    stripped — not as the raw string. Hashing the raw value would miss the file on every session that sets it."""
+    monkeypatch.setenv('HOME', str(tmp_path))
+    sso_config = {**_SSO_CONFIG, 'sso_registration_scopes': 'sso:account:access, codewhisperer:completions'}
+    registration = _plant_registration(_aws_cli_registration_key(sso_config=sso_config), 'client-corp')
+    full_config = {'profiles': {}, 'sso_sessions': {_SESSION: sso_config}}
+
+    keychain.purge_session_plaintext(_SESSION, full_config)
+
+    assert not registration.exists()
+
+
+def test_purge_leaves_another_sessions_client_registration_alone(tmp_path, monkeypatch, capsys):
+    """The constraint that shapes the whole feature: deleting somebody else's registration is a worse failure than
+    leaving one behind. A registration blob names no session at all, so one that matches neither this session's
+    clientId nor the name the CLI derives for it is not this session's to touch."""
+    monkeypatch.setenv('HOME', str(tmp_path))
+    token = _plant_plaintext_token(client_id='client-corp')
+    mine = _plant_registration(_aws_cli_registration_key(), 'client-corp')
+    theirs = _plant_registration(_aws_cli_registration_key(_OTHER_SESSION), 'client-other')
+    unattributable = _plant_registration(_UNRELATED_NAME, 'client-nobody-knows')
+
+    keychain.purge_session_plaintext(_SESSION, _secure_session_config())
+
+    assert not token.exists()
+    assert not mine.exists()
+    assert theirs.is_file()  # another session's client secret, and none of brolly's business
+    assert unattributable.is_file()  # attributable to nothing, so left behind rather than deleted on a guess
+
+
+def test_purge_never_deletes_a_token_blob_even_one_carrying_this_sessions_client_id(tmp_path, monkeypatch):
+    """Token blobs carry a clientId too — the CLI caches the registration alongside the token — so a clientId match
+    alone would let the purge reach another session's *token*, breaking a live session outright. Only a file with
+    no accessToken is ever a registration, which is what keeps the match off them."""
+    monkeypatch.setenv('HOME', str(tmp_path))
+    _plant_plaintext_token(client_id='client-corp')
+    others_token = _plant_plaintext_token(_OTHER_SESSION, client_id='client-corp')
+    others_bytes = others_token.read_bytes()
+
+    keychain.purge_session_plaintext(_SESSION, _secure_session_config())
+
+    assert others_token.read_bytes() == others_bytes  # byte for byte, not merely still present
+
+
+def test_purge_tolerates_files_in_the_cache_directory_it_cannot_read(tmp_path, monkeypatch, capsys):
+    """~/.aws/sso/cache is the AWS CLI's directory and brolly is a guest in it: a half-written file, a stray note,
+    a JSON document of the wrong shape, something unreadable. None of that may crash a purge, and none of it may
+    be deleted either."""
+    monkeypatch.setenv('HOME', str(tmp_path))
+    token = _plant_plaintext_token(client_id='client-corp')
+    registration = _plant_registration(_UNRELATED_NAME, 'client-corp')
+    cache_dir = keychain._sso_cache_dir()
+    junk = cache_dir / 'half-written.json'
+    junk.write_text('{"clientId": "client-corp", "clientSec')
+    not_an_object = cache_dir / 'a-list.json'
+    not_an_object.write_text('[1, 2, 3]')
+    a_directory = cache_dir / 'directory.json'
+    a_directory.mkdir()
+    unreadable = cache_dir / 'locked.json'
+    unreadable.write_text(json.dumps({'clientId': 'client-corp', 'clientSecret': 's', 'expiresAt': 'x'}))
+    unreadable.chmod(0o000)
+
+    keychain.purge_session_plaintext(_SESSION, _secure_session_config())  # must not raise
+
+    assert not token.exists()
+    assert not registration.exists()  # the one it could read and attribute still went
+    assert junk.is_file() and not_an_object.is_file() and a_directory.is_dir() and unreadable.is_file()
+
+
+def test_purge_holds_the_registration_back_on_the_same_guard_as_the_token(tmp_path, monkeypatch, capsys):
+    """The registration is not a second, unguarded delete: while a stock profile still resolves out of this
+    session's cache the whole purge stands down, and the message says which files are still there rather than
+    calling a client registration a token."""
+    monkeypatch.setenv('HOME', str(tmp_path))
+    token = _plant_plaintext_token(client_id='client-corp')
+    registration = _plant_registration(_aws_cli_registration_key(), 'client-corp')
+    full_config = {
+        'profiles': {_STOCK: {'sso_session': _SESSION, 'sso_account_id': _ACCOUNT, 'sso_role_name': _ROLE}},
+        'sso_sessions': {_SESSION: _SSO_CONFIG},
+    }
+
+    keychain.purge_session_plaintext(_SESSION, full_config)
+
+    assert token.is_file()
+    assert registration.is_file()
+    err = capsys.readouterr().err
+    assert 'its token and the OIDC client registration `aws sso login` cached with it' in err
+    assert _STOCK in err
+
+
+def test_device_login_purges_the_registration_the_previous_aws_login_left(aws_env, monkeypatch, capsys):
+    """brolly's own device login caches no registration to disk, so anything it finds is an `aws sso login`
+    leftover — and it has just replaced the token that leftover minted."""
+    monkeypatch.setenv('AWS_CONFIG_FILE', str(aws_env))
+    token = _plant_plaintext_token(client_id='client-corp')
+    registration = _plant_registration(_UNRELATED_NAME, 'client-corp')
+
+    _login(monkeypatch, _FakeKeyring(), oidc=_FakeOidc())
+
+    assert not token.exists()
+    assert not registration.exists()
 
 
 def test_device_login_purges_a_planted_plaintext_token(aws_env, monkeypatch, capsys):

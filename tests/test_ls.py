@@ -45,6 +45,43 @@ def _plaintext_cache_path(home, session: str):
     return home / '.aws' / 'sso' / 'cache' / f'{key}.json'
 
 
+_START_URL = 'https://corp.awsapps.com/start'
+_REGION = 'us-east-1'
+
+
+def _secured_config(session: str, profiles: dict[str, dict]) -> dict:
+    """A full_config whose sso-session carries the start URL too — what the name of a client registration is
+    derived from, and what a bare ``{'sso_region': ...}`` stub cannot stand in for."""
+    return {
+        'sso_sessions': {session: {'sso_region': _REGION, 'sso_start_url': _START_URL}},
+        'profiles': profiles,
+    }
+
+
+def _registration_cache_path(home, session: str):
+    """Where `aws sso login` files this session's OIDC client registration, derived here rather than asked of
+    brolly — the point of that route is parity with the AWS CLI's own naming, and asking brolly for the name would
+    only prove brolly agrees with itself. Verbatim from ``BaseSSOTokenFetcher._registration_cache_key``."""
+    args = {
+        'tool': 'botocore',
+        'startUrl': _START_URL,
+        'region': _REGION,
+        'scopes': None,
+        'session_name': session,
+    }
+    key = hashlib.sha1(json.dumps(args, sort_keys=True).encode('utf-8')).hexdigest()
+    return home / '.aws' / 'sso' / 'cache' / f'{key}.json'
+
+
+def _plant_registration(path, client_id: str = 'client-corp'):
+    """A client-registration blob exactly as `aws sso login` writes one: a clientId, a client secret with a ~90-day
+    life, an expiry — and nothing at all naming the session it belongs to."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    expires = (datetime.now(UTC) + timedelta(days=90)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    path.write_text(json.dumps({'clientId': client_id, 'clientSecret': 'registration-secret', 'expiresAt': expires}))
+    return path
+
+
 def _secure_sidecar_path(config_dir, session: str):
     key = hashlib.sha1(session.encode('utf-8')).hexdigest()
     return config_dir / 'brolly' / f'{key}.json'
@@ -151,22 +188,115 @@ def test_ls_flags_a_leaked_plaintext_blob_under_a_secured_session(env, capsys):
     cli.cmd_ls(full_config, 'none', False)
     out = capsys.readouterr().out
 
-    assert "still holds this session's token" in out
+    assert '~/.aws/sso/cache still holds its token' in out
     assert f'brolly secure enable -s {_ALPHA}' in out
     assert plaintext.is_file()  # ls reports; it never mutates
+
+
+def test_ls_flags_an_orphaned_client_registration_that_leaves_no_token_behind(env, capsys):
+    """`aws sso login` leaves two credentials in that directory, not one, and the second outlives the first: an
+    OIDC client registration is a client secret with roughly a 90-day life. A session whose token has gone but
+    whose registration has not used to report as clean, because the warning only ever stat'd the token blob."""
+    full_config = _secured_config(_ALPHA, {'alpha-secure': _secure_profile(_ALPHA, '1' * 12, 'Admin')})
+    registration = _plant_registration(_registration_cache_path(env, _ALPHA))
+
+    cli.cmd_ls(full_config, 'none', False)
+    out = capsys.readouterr().out
+
+    assert 'still holds the OIDC client registration' in out
+    assert 'its token' not in out  # naming a client registration a token would send the reader to the wrong file
+    assert f'brolly secure enable -s {_ALPHA}' in out
+    assert registration.is_file()  # `ls` reports; it never deletes, and that is load-bearing for this command
+
+
+def test_ls_names_both_leftovers_when_a_session_left_a_token_and_its_registration(env, capsys):
+    """The two are separate credentials and the report says so, in one line rather than as one thing. Here the
+    registration sits under a name brolly cannot derive, so the only thing that can have attributed it is the
+    clientId the token blob carries — the same attribution the purge uses, reused rather than re-invented."""
+    full_config = _secured_config(_ALPHA, {'alpha-secure': _secure_profile(_ALPHA, '1' * 12, 'Admin')})
+    token = _plaintext_cache_path(env, _ALPHA)
+    token.parent.mkdir(parents=True)
+    token.write_text(json.dumps({'accessToken': 'stale', 'refreshToken': 'leaked', 'clientId': 'client-corp'}))
+    registration = _plant_registration(token.parent / f'{"0" * 40}.json', client_id='client-corp')
+
+    cli.cmd_ls(full_config, 'none', False)
+    out = capsys.readouterr().out
+
+    assert 'still holds its token and the OIDC client registration' in out
+    assert token.is_file() and registration.is_file()
+
+
+def test_ls_leaves_another_sessions_client_registration_out_of_the_report(env, capsys):
+    """The attribution has to hold in `ls` exactly as it holds in the purge: a registration blob names no session,
+    so one that matches neither this session's clientId nor the name the AWS CLI derives for it is not this
+    session's — and reporting it would send the user to delete a credential of somebody else's."""
+    full_config = _secured_config(_ALPHA, {'alpha-secure': _secure_profile(_ALPHA, '1' * 12, 'Admin')})
+    _plant_registration(_registration_cache_path(env, _ZETA), client_id='client-zeta')
+
+    cli.cmd_ls(full_config, 'none', False)
+
+    assert '~/.aws/sso/cache still holds' not in capsys.readouterr().out
 
 
 def test_ls_omits_the_leaked_warning_for_a_clean_secured_session(env, capsys):
     full_config = _full_config({_ALPHA: 'us-east-1'}, {'alpha-secure': _secure_profile(_ALPHA, '1' * 12, 'Admin')})
     cli.cmd_ls(full_config, 'none', False)  # no plaintext blob planted
-    assert "still holds this session's token" not in capsys.readouterr().out
+    assert '~/.aws/sso/cache still holds' not in capsys.readouterr().out
 
 
 def test_ls_omits_the_leaked_warning_for_a_plaintext_session_with_its_own_legitimate_cache_file(env, capsys):
     full_config = _full_config({_ALPHA: 'us-east-1'}, {'alpha-plain': _plaintext_profile(_ALPHA, '1' * 12, 'Admin')})
     _expiry_file(_plaintext_cache_path(env, _ALPHA), hours=8)  # its own cache file — not a leak, the session is plain
     cli.cmd_ls(full_config, 'none', False)
-    assert "still holds this session's token" not in capsys.readouterr().out
+    assert '~/.aws/sso/cache still holds' not in capsys.readouterr().out
+
+
+def test_ls_reports_a_session_whose_token_has_not_migrated_yet_as_stock_rather_than_gone(env, capsys):
+    """The state `ls` used to describe as the opposite of what it is. The session is recorded as secured, but its
+    keychain holds nothing yet and its profiles are still stock — so they are resolving credentials perfectly well
+    out of ~/.aws/sso/cache. `ls` never heals, so it is the command most likely to be run in exactly this state."""
+    cli._record_secured_session(_ALPHA, True)  # secured by the record alone: no profile carries the secure shape
+    full_config = _secured_config(_ALPHA, {'alpha-a': _plaintext_profile(_ALPHA, '1' * 12, 'Admin')})
+    _expiry_file(_plaintext_cache_path(env, _ALPHA), hours=8, refreshToken='rt')
+
+    cli.cmd_ls(full_config, 'none', False)
+    section = _sections(capsys.readouterr().out)[0]
+
+    assert 'stock' in section
+    assert 'gone' not in section and 'no valid token' not in section
+    assert 'secured, not migrated yet' in section
+    assert cli._LOCK in section  # the session really is secured; it is the token that has not moved
+    # the leaked line still runs underneath, and the two read as one thing: what is true, then what to do about it
+    assert '~/.aws/sso/cache still holds its token' in section
+    assert 'the next brolly command using this session clears it' in section
+
+
+def test_ls_still_says_gone_for_a_migrated_session_whose_blob_merely_lingers(env, capsys):
+    """The other half of the rule, and the one that keeps `stock` from swallowing a real failure: with the profiles
+    converted, nothing resolves out of that blob any more. The session is genuinely gone — and still leaking."""
+    cli._record_secured_session(_ALPHA, True)
+    full_config = _secured_config(_ALPHA, {'alpha-secure': _secure_profile(_ALPHA, '1' * 12, 'Admin')})
+    _expiry_file(_plaintext_cache_path(env, _ALPHA), hours=8, refreshToken='rt')
+
+    cli.cmd_ls(full_config, 'none', False)
+    section = _sections(capsys.readouterr().out)[0]
+
+    assert 'gone' in section and 'no valid token' in section
+    assert 'stock' not in section
+    assert '~/.aws/sso/cache still holds its token' in section  # reported, just not as a migration
+
+
+def test_ls_still_says_gone_for_stock_profiles_with_no_blob_left_to_resolve_from(env, capsys):
+    """Stock profiles alone are not a migration waiting to finish: with the blob gone they resolve nothing at all,
+    which is precisely what 'gone' means."""
+    cli._record_secured_session(_ALPHA, True)
+    full_config = _secured_config(_ALPHA, {'alpha-a': _plaintext_profile(_ALPHA, '1' * 12, 'Admin')})
+
+    cli.cmd_ls(full_config, 'none', False)  # nothing planted in ~/.aws/sso/cache at all
+    section = _sections(capsys.readouterr().out)[0]
+
+    assert 'gone' in section and 'no valid token' in section
+    assert 'stock' not in section
 
 
 def test_ls_secure_cell_is_centered_in_its_column(env, monkeypatch, capsys):
@@ -385,6 +515,14 @@ def test_status_detail_gone_ignores_expiry():
     expiry = datetime.now(UTC) + timedelta(hours=1)
     assert cli._status_detail('gone', expiry) == 'no valid token'
     assert cli._status_detail('gone', None) == 'no valid token'
+
+
+def test_status_detail_stock_says_what_is_still_resolving_rather_than_an_expiry():
+    """The sidecar it would read an expiry from does not exist yet — that is the state. What the colspan carries
+    instead is why the session is not gone, leaving the line under it to say what is on disk and what clears it."""
+    detail = cli._status_detail('stock', None)
+    assert 'secured, not migrated yet' in detail
+    assert 'still resolve from the plaintext token' in detail
 
 
 def test_status_detail_empty_when_no_expiry():

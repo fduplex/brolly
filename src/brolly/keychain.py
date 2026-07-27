@@ -48,6 +48,7 @@ from .cli import (
     _aws_dir,
     _config_path,
     _create_profile_skeleton,
+    _ensure_brolly_dir,
     _is_secure,
     _pick_account_role,
     _read_config,
@@ -182,43 +183,212 @@ def _write_sidecar(session_name: SessionName, cache_key: str, expires_at: object
     ``refreshable`` mirrors whether the stored blob carries a refresh token — the one fact that separates a token
     that renews silently from one that ends in a browser, and the only way `ls` can tell without a keychain read.
     """
-    path = _sidecar_path(cache_key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({'session': session_name, 'expiresAt': _iso(expires_at), 'refreshable': refreshable}))
+    _ensure_brolly_dir()
+    _atomic_write(
+        _sidecar_path(cache_key),
+        json.dumps({'session': session_name, 'expiresAt': _iso(expires_at), 'refreshable': refreshable}),
+    )
 
 
 def _remove_sidecar(cache_key: str) -> None:
     _sidecar_path(cache_key).unlink(missing_ok=True)
 
 
+def _sso_cache_dir() -> Path:
+    """The stock plaintext SSO cache — botocore's fixed ``~/.aws/sso/cache``, and the AWS CLI's directory, not ours."""
+    return Path.home() / '.aws' / 'sso' / 'cache'
+
+
 def _plaintext_token_path(session_name: SessionName) -> Path:
     """The stock plaintext SSO token file for a session — botocore's fixed ``~/.aws/sso/cache`` location."""
-    return Path.home() / '.aws' / 'sso' / 'cache' / f'{_cache_key(session_name)}.json'
+    return _sso_cache_dir() / f'{_cache_key(session_name)}.json'
 
 
-def _remove_plaintext_token(session_name: SessionName) -> bool:
-    """Delete the now-redundant plaintext SSO token (it lives in the keychain now). True if a file was removed."""
-    path = _plaintext_token_path(session_name)
+def _read_cache_json(path: Path) -> Any:
+    """One file from ~/.aws/sso/cache decoded as JSON, or None if it will not decode as any.
+
+    That directory belongs to the AWS CLI and may hold anything — a half-written file, a stray note, a directory
+    someone put there. A file brolly cannot read is a file brolly must never act on, so the failure is a value
+    rather than an exception: nothing here is worth crashing a purge over.
+    """
+    try:
+        return json.loads(path.read_text())
+    except OSError, ValueError:
+        return None
+
+
+_REGISTRATION_KEYS = frozenset({'clientId', 'clientSecret', 'expiresAt'})
+
+
+def _is_registration_blob(data: Any) -> bool:
+    """True if a parsed cache file is an OIDC client registration rather than a token blob or something else.
+
+    The AWS CLI writes a registration as exactly ``clientId``, ``clientSecret`` and ``expiresAt``, plus ``scopes``
+    (and ``grantTypes`` on the authorization-code flow) — no startUrl, no region, no session name. So its shape
+    says *what* a file is and never *whose* it is; saying whose is what ``_session_registrations`` is for.
+    ``accessToken`` is the token blob's own key, and testing for its absence is what stops this ever matching one:
+    a token blob carries a clientId too, because the CLI caches the registration alongside it.
+    """
+    return isinstance(data, dict) and 'accessToken' not in data and data.keys() >= _REGISTRATION_KEYS
+
+
+def _registration_cache_key(session_name: SessionName, sso_config: AwsConfig) -> str | None:
+    """The file name `aws sso login` gives this session's client registration, or None if brolly cannot know it.
+
+    Quoted from the AWS CLI v2's ``BaseSSOTokenFetcher._registration_cache_key`` (awscli/botocore/utils.py)::
+
+        args = {
+            'tool': 'botocore',
+            'startUrl': start_url,
+            'region': self._sso_region,
+            'scopes': scopes,
+            'session_name': session_name,
+        }
+        cache_args = json.dumps(args, sort_keys=True).encode('utf-8')
+        return hashlib.sha1(cache_args).hexdigest()
+
+    ``scopes`` is the sso-session's ``sso_registration_scopes`` put through the CLI's own
+    ``parse_sso_registration_scopes`` — comma-split, stripped, empties dropped — and None, not ``[]``, when the key
+    is absent entirely. Not brolly's ``_registration_scopes``, which unions in the account scope brolly's own
+    registration needs: this has to be what the AWS CLI passed, not what brolly would have.
+
+    Which is also why this is only half an answer. The hash is a function of config that may have changed since
+    the login that wrote the file, and a stale ``sso_registration_scopes`` yields a name that matches nothing.
+    ``_session_registrations`` therefore treats it as one route among two, never as the identification.
+    """
+    start_url, region = sso_config.get('sso_start_url'), sso_config.get('sso_region')
+    if not (start_url and region):
+        return None
+    raw_scopes = sso_config.get('sso_registration_scopes')
+    scopes = None if raw_scopes is None else [s.strip() for s in raw_scopes.split(',') if s.strip()]
+    args = {
+        'tool': 'botocore',
+        'startUrl': start_url,
+        'region': region,
+        'scopes': scopes,
+        'session_name': session_name,
+    }
+    return sha1(json.dumps(args, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _token_client_id(session_name: SessionName) -> str | None:
+    """The ``clientId`` in this session's plaintext token blob — the name of the registration that minted it."""
+    blob = _read_cache_json(_plaintext_token_path(session_name))
+    client_id = blob.get('clientId') if isinstance(blob, dict) else None
+    return client_id if isinstance(client_id, str) else None
+
+
+def _session_registrations(session_name: SessionName, sso_config: AwsConfig) -> list[Path]:
+    """The OIDC client registrations in ~/.aws/sso/cache that are provably this session's.
+
+    `aws sso login` writes two credentials, not one: the token blob, and the client registration it was minted
+    under — a clientId/clientSecret pair with roughly a 90-day life. Secure mode leaves nothing of the session's
+    in that directory, but deleting somebody else's registration is a worse failure than leaving one behind, so a
+    file is only ever taken on one of two positive attributions, and one matched by neither is left alone:
+
+    - **the token blob names it.** The CLI copies the registration's clientId and clientSecret into the token it
+      writes ("Cache the registration alongside the token" — botocore/tokens.py), so a registration whose clientId
+      is the one in *this* session's token blob is the registration that minted it. This is the route that matters
+      in practice: what brolly purges is a leaked token blob, and the blob identifies its own registration.
+    - **the name is reproducible.** See ``_registration_cache_key``: a file under that exact name which reads as a
+      registration is this session's by construction. It is the only route left once the token blob is gone, and
+      it holds only while ``sso_registration_scopes`` is what it was at login time.
+
+    Neither route can reach a token blob, this session's or another's — ``_is_registration_blob`` excludes anything
+    carrying an ``accessToken``. brolly's own ``_device_login`` caches no registration to disk, so every file this
+    finds is an `aws sso login` leftover.
+    """
+    found: dict[Path, None] = {}  # an ordered set: the two routes can name the same file
+    cache_key = _registration_cache_key(session_name, sso_config)
+    if cache_key is not None:
+        by_name = _sso_cache_dir() / f'{cache_key}.json'
+        if _is_registration_blob(_read_cache_json(by_name)):
+            found[by_name] = None
+    client_id = _token_client_id(session_name)
+    if client_id is not None:
+        for candidate in sorted(_sso_cache_dir().glob('*.json')):
+            data = _read_cache_json(candidate)
+            if _is_registration_blob(data) and data['clientId'] == client_id:
+                found[candidate] = None
+    return list(found)
+
+
+class _Leftovers(NamedTuple):
+    """What ~/.aws/sso/cache still holds for one session: its token blob, and every client registration in that
+    directory brolly can positively attribute to it."""
+
+    token: Path | None
+    registrations: list[Path]
+
+    @property
+    def paths(self) -> list[Path]:
+        """Every file, token first — the order they are reported and removed in."""
+        return [*([self.token] if self.token is not None else []), *self.registrations]
+
+    @property
+    def phrase(self) -> str:
+        """How to name what is on disk inside a sentence. The two files are different credentials with different
+        lives, and a message that called a client registration a "token" would send the reader to the wrong file."""
+        parts = ['its token'] if self.token is not None else []
+        if self.registrations:
+            parts.append('the OIDC client registration `aws sso login` cached with it')
+        return ' and '.join(parts)
+
+
+def _sso_session_config(session_name: SessionName, full_config: AwsConfig | None) -> AwsConfig:
+    """The sso-session's own config block, or an empty one. A caller with no ``full_config`` to hand loses only the
+    reproducible-name route to a registration (see ``_session_registrations``), never the token."""
+    return (full_config or {}).get('sso_sessions', {}).get(session_name, {})
+
+
+def _plaintext_leftovers(session_name: SessionName, sso_config: AwsConfig) -> _Leftovers:
+    """Everything in ~/.aws/sso/cache that is provably this session's — and nothing that is merely near it."""
+    token = _plaintext_token_path(session_name)
+    return _Leftovers(token if token.is_file() else None, _session_registrations(session_name, sso_config))
+
+
+def _unlink_cache_file(path: Path, what: str) -> bool:
+    """Delete one file from ~/.aws/sso/cache. True if a file was there and went."""
     try:
         path.unlink()
     except FileNotFoundError:
         return False
     except OSError as x:
-        # a token we cannot delete must still not break the command that noticed it — report and carry on
-        print(f'! could not remove the plaintext token cache {path}: {x}', file=sys.stderr)
+        # something we cannot delete must still not break the command that noticed it — report and carry on
+        print(f'! could not remove the plaintext {what} {path}: {x}', file=sys.stderr)
         return False
     return True
 
 
-def _purge_plaintext_token(session_name: SessionName) -> None:
-    """Drop any plaintext blob for a secured session, saying so — silence would hide that a token was on disk.
+def _remove_plaintext_token(session_name: SessionName) -> bool:
+    """Delete the now-redundant plaintext SSO token (it lives in the keychain now). True if a file was removed."""
+    return _unlink_cache_file(_plaintext_token_path(session_name), 'token cache')
+
+
+def _remove_leftovers(session_name: SessionName, leftovers: _Leftovers) -> None:
+    """Delete what was attributed to the session, naming each file — silence would hide that a credential was on
+    disk. Takes an already-computed ``_Leftovers`` because the token blob is what identifies its own registration:
+    read the directory first, delete second, or the second file loses the only thing that pointed at it."""
+    if leftovers.token is not None and _unlink_cache_file(leftovers.token, 'token cache'):
+        print(f"✓ removed plaintext token cache for session '{session_name}'", file=sys.stderr)
+    for path in leftovers.registrations:
+        if _unlink_cache_file(path, 'client registration'):
+            print(
+                f"✓ removed the OIDC client registration `aws sso login` cached for session '{session_name}' — a "
+                f"client secret with a ~90-day life, and brolly's own login registers its own client",
+                file=sys.stderr,
+            )
+
+
+def _purge_plaintext_token(session_name: SessionName, sso_config: AwsConfig) -> None:
+    """Drop everything a secured session left in ~/.aws/sso/cache — its token blob and the client registration
+    `aws sso login` cached beside it.
 
     Unconditional, and only one caller may be: a completed device login, which has just put a fresh token in the
-    keychain and so has made the file it deletes stale by definition. Everything else — `secure enable` included —
+    keychain and so has made what it deletes stale by definition. Everything else — `secure enable` included —
     goes through ``purge_session_plaintext``, which first checks that nothing still resolves out of it.
     """
-    if _remove_plaintext_token(session_name):
-        print(f"✓ removed plaintext token cache for session '{session_name}'", file=sys.stderr)
+    _remove_leftovers(session_name, _plaintext_leftovers(session_name, sso_config))
 
 
 def _stock_profiles(session_name: SessionName, full_config: AwsConfig) -> list[ProfileName]:
@@ -252,9 +422,9 @@ def _note_reshape_failures(full_config: AwsConfig, session_name: SessionName, fa
 def _reshape_failures(session_name: SessionName, full_config: AwsConfig | None) -> list[ProfileName]:
     """Profiles the most recent reshape of this exact ``full_config`` failed to convert, if any.
 
-    ``None`` (a caller with nothing reshaped, e.g. ``cmd_credential_process``) and a plain dict freshly loaded from
-    disk both answer "none" — only a ``full_config`` that a reshape has actually run over and mutated in place can
-    carry this, which is exactly the set of callers this needs to affect.
+    ``None`` (a caller with nothing reshaped) and a plain dict freshly loaded from disk both answer "none" — only a
+    ``full_config`` that a reshape has actually run over and mutated in place can carry this, which is exactly the
+    set of callers this needs to affect.
     """
     if full_config is None:
         return []
@@ -262,8 +432,9 @@ def _reshape_failures(session_name: SessionName, full_config: AwsConfig | None) 
 
 
 def purge_session_plaintext(session_name: SessionName, full_config: AwsConfig | None = None) -> None:
-    """Clear a secured session's plaintext token whether or not this command authenticated — ``cli`` runs this from
-    the one place that decides a session is secure, so no command can forget it.
+    """Clear what a secured session left in ~/.aws/sso/cache — its token blob, and the OIDC client registration
+    `aws sso login` cached beside it — whether or not this command authenticated. ``cli`` runs this from the one
+    place that decides a session is secure, so no command can forget it.
 
     Two guards, both stated rather than silent, and neither a replacement for the other:
 
@@ -275,32 +446,61 @@ def purge_session_plaintext(session_name: SessionName, full_config: AwsConfig | 
       ``_note_reshape_failures`` for the shadowed-section case that makes it invisible to ``_stock_profiles``
       entirely — so a failed reshape holds the purge back on its own account, unconditionally.
 
-    Both stand for ``cmd_credential_process``, which shares the purge but runs non-interactively on every cold
-    credential resolution and must not rewrite ``~/.aws/config`` behind the SDK — and which never reshapes, so
-    never trips the second guard.
+    Neither guard stands for ``cmd_credential_process`` any more: that path reports and never deletes at all, so
+    it does not come through here — see ``report_session_plaintext``.
     """
-    if not _plaintext_token_path(session_name).is_file():
-        return  # the common case, and the only cost on it: one stat
-    stock = _stock_profiles(session_name, full_config or botocore.session.Session().full_config)
-    if stock:
+    leftovers = _plaintext_leftovers(session_name, _sso_session_config(session_name, full_config))
+    if not leftovers.paths:
+        return  # the common case, and its whole cost: three lookups that miss on files which are not there
+    if stock := _stock_profiles(session_name, full_config or botocore.session.Session().full_config):
         print(
-            f"! session '{session_name}' is secured, but ~/.aws/sso/cache still holds its token — "
+            f"! session '{session_name}' is secured, but ~/.aws/sso/cache still holds {leftovers.phrase} — "
             f'{", ".join(stock)} still resolves credentials from it, so this command left it alone.\n'
             f'  Convert it and clear the file:  brolly secure enable -s {session_name}',
             file=sys.stderr,
         )
         return
-    failed = _reshape_failures(session_name, full_config)
-    if failed:
+    if failed := _reshape_failures(session_name, full_config):
         print(
-            f"! session '{session_name}' is secured, but ~/.aws/sso/cache still holds its token — "
+            f"! session '{session_name}' is secured, but ~/.aws/sso/cache still holds {leftovers.phrase} — "
             f'{", ".join(failed)} just failed to convert to secure mode, so this command deliberately left the '
             f'plaintext token in place rather than delete a blob that profile may still need.\n'
             f'  Fix the profile (see the error reported above), then re-run:  brolly secure enable -s {session_name}',
             file=sys.stderr,
         )
         return
-    _purge_plaintext_token(session_name)
+    _remove_leftovers(session_name, leftovers)
+
+
+def report_session_plaintext(session_name: SessionName, full_config: AwsConfig) -> None:
+    """Name what ~/.aws/sso/cache still holds for a secured session, and remove nothing at all.
+
+    ``cmd_credential_process``'s counterpart to ``purge_session_plaintext``, and a separate function rather than a
+    parameter on it: this is the one caller that must never touch the filesystem, and a flag whose default deletes
+    is exactly the kind of thing a later edit gets backwards at a call site. It also has no use for the purge's two
+    guards, which decide *whether* to delete — nothing here is conditional, because nothing here is destructive.
+
+    Why it reports rather than purges. `credential-process` is spawned by the SDK on every cold credential
+    resolution, non-interactively, and the purge's guards only recognise consumers that exist as AWS profiles: a
+    third-party SSO helper, a script, a container mount reading that blob is invisible to them, so deleting it here
+    could silently break a consumer brolly cannot see. Every interactive path still purges, so the leak closes the
+    next time the user runs a brolly command — which the message says, so nobody reads this as brolly ignoring it.
+
+    Everything goes to stderr. stdout carries the credential JSON the calling SDK parses, and a stray byte on it
+    breaks the process this is supposed to be serving.
+    """
+    leftovers = _plaintext_leftovers(session_name, _sso_session_config(session_name, full_config))
+    if not leftovers.paths:
+        return
+    listed = '\n'.join(f'      {path}' for path in leftovers.paths)
+    print(
+        f"! session '{session_name}' is secured, but ~/.aws/sso/cache still holds {leftovers.phrase}:\n"
+        f'{listed}\n'
+        f'  credential-process only reports this: it runs unattended for whatever spawned it, so it will not '
+        f'delete a file another tool may still be reading.\n'
+        f'  The next brolly command clears it, or clear it now:  brolly secure enable -s {session_name}',
+        file=sys.stderr,
+    )
 
 
 def _keyring_call(keyring_module: ModuleType, operation: Any, *args: str) -> Any:
@@ -455,6 +655,27 @@ def _profile_on_disk(profile: ProfileName) -> AwsConfig:
     return botocore.session.Session().full_config['profiles'].get(profile, {})
 
 
+def _brolly_credential_process(profile: ProfileName) -> str:
+    """The ``credential_process`` a secured profile carries: brolly re-entered for this profile by the calling SDK."""
+    return f'brolly credential-process --profile {profile}'
+
+
+def _is_brolly_credential_process(command: str) -> bool:
+    """True if a ``credential_process`` value is brolly's own — the key secure mode has to own to work at all.
+
+    Matched on the command rather than by string equality with what ``_brolly_credential_process`` writes: the same
+    helper spelled with a path or a runner (``/usr/local/bin/brolly credential-process …``, ``uv run brolly
+    credential-process …``) is still brolly holding the key, and calling those a conflict would be a conflict
+    brolly invented. Anything else — any value that does not run brolly's own subcommand — is somebody else's
+    credential helper, and secure mode does not get to overwrite it.
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    return 'credential-process' in parts and any(Path(part).name == 'brolly' for part in parts)
+
+
 def _secure_profile(
     profile: ProfileName,
     account_id: AccountId,
@@ -464,15 +685,34 @@ def _secure_profile(
 ) -> bool:
     """Rewrite one profile into secure shape: add ``credential_process`` + ``brolly_sso_*``, drop the SSO trigger.
 
-    Returns whether the profile really is secure now. The removal is a line edit against a file botocore parses
-    more liberally than any matcher of ours, so the result is read back rather than assumed: a profile that kept
-    its stock keys still resolves out of ~/.aws/sso/cache, and reporting it as converted would license deleting the
-    very blob it reads.
+    Returns whether the profile really is secure now, and says why whenever that is no. Two ways it can be no, one
+    checked before anything is written and one read back after:
+
+    - the profile already has a ``credential_process`` brolly did not write. Secure mode genuinely needs that key
+      — it *is* how a secured profile gets credentials — but a user's own helper is not brolly's to destroy, so a
+      foreign value is a conflict to report, not a line to overwrite. Nothing is mutated on that path; the profile
+      stays stock, which is also what holds the session's plaintext token back (see ``purge_session_plaintext``).
+    - the removal is a line edit against a file botocore parses more liberally than any matcher of ours, so its
+      result is read back rather than assumed: a profile that kept its stock keys still resolves out of
+      ~/.aws/sso/cache, and reporting it as converted would license deleting the very blob it reads.
 
     ``cfg`` is this profile's entry in a caller's already-loaded ``full_config``; passing it replaces that
     in-memory copy with what is now on disk, so nothing downstream in the same command works off a false premise.
     """
-    command = f'brolly credential-process --profile {profile}'
+    existing: str | None = _profile_on_disk(profile).get('credential_process')
+    if existing and not _is_brolly_credential_process(existing):
+        print(
+            f"! '{profile}' already has a credential_process brolly did not write, so it was left exactly as it "
+            f'is and not converted:\n'
+            f'      credential_process = {existing}\n'
+            f"  Secure mode has to own that key, so brolly treats another tool's helper as a conflict rather than "
+            f'overwriting it. Remove or repoint that line to convert this profile; until then it goes on resolving '
+            f"from ~/.aws/sso/cache, and the session's plaintext token stays on disk with it.",
+            file=sys.stderr,
+        )
+        return False
+
+    command = _brolly_credential_process(profile)
     _aws('configure', 'set', 'credential_process', command, '--profile', profile)
     _aws('configure', 'set', 'brolly_sso_account_id', account_id, '--profile', profile)
     _aws('configure', 'set', 'brolly_sso_role_name', role, '--profile', profile)
@@ -630,7 +870,7 @@ def _device_login(session_name: SessionName, sso_config: AwsConfig, cache: _Keyc
         blob['refreshToken'] = token['refreshToken']
     cache[_cache_key(session_name)] = blob
     print('✓ authorized — SSO token stored in your OS keychain', file=sys.stderr)
-    _purge_plaintext_token(session_name)
+    _purge_plaintext_token(session_name, sso_config)
     if 'refreshToken' not in blob:
         print(
             f'! IAM Identity Center issued no refresh token for this session, so it cannot renew silently — '
@@ -691,10 +931,11 @@ def cmd_credential_process(profile: ProfileName) -> None:
     if session_name not in sso_sessions:
         raise SystemExit(f"sso-session '{session_name}' referenced by '{profile}' is not defined")
     sso_region: Region = sso_sessions[session_name]['sso_region']
-    # One stat on the common path (the file is normally absent), and everything it may print goes to stderr —
+    # Three lookups that miss on the common path (the files are normally absent), and all it prints goes to stderr —
     # stdout belongs to the credential JSON. Worth it: this runs on every cold resolution, so it is the path most
-    # likely to be the first to notice a blob that some other tool wrote back into the cache.
-    purge_session_plaintext(session_name, full_config)
+    # likely to be the first to notice a blob that some other tool wrote back into the cache. It reports and never
+    # removes — the report-don't-mutate posture this already had toward ~/.aws/config, extended to the filesystem.
+    report_session_plaintext(session_name, full_config)
 
     keyring_module = _configured_keyring()
     access_token = load_secure_token(profile, session_name, keyring_module)
@@ -860,7 +1101,10 @@ def cmd_secure_switch(profile: ProfileName, full_config: AwsConfig) -> None:
     account, role = _pick_account_role(
         sso_region, token, cfg.get('brolly_sso_account_id'), cfg.get('brolly_sso_role_name')
     )
-    _secure_profile(profile, account['accountId'], role, account['accountName'])
+    if not _secure_profile(profile, account['accountId'], role, account['accountName']):
+        # `_secure_profile` has just printed why in full; what must not follow it is a ✓ line claiming a profile
+        # was repointed when the write was refused — the caller would take that for a working secure profile
+        raise SystemExit(1)
     print(f'✓  {profile} → {account["accountId"]} ({account["accountName"]}) / {role}')
 
 
@@ -876,5 +1120,8 @@ def cmd_secure_add(session_name: SessionName, new_profile: ProfileName, full_con
     token = _ensure_secure_token(new_profile, session_name, full_config, keyring_module)
     purge_session_plaintext(session_name, full_config)
     account, role = _pick_account_role(sso_region, token)
-    _secure_profile(new_profile, account['accountId'], role, account['accountName'])
+    if not _secure_profile(new_profile, account['accountId'], role, account['accountName']):
+        # `_secure_profile` has just printed why in full; what must not follow it is an "added" line claiming a
+        # profile that is not in secure shape — the caller would take that for a working secure profile
+        raise SystemExit(1)
     _report_added(new_profile, account, role)

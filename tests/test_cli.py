@@ -135,17 +135,46 @@ def test_read_config_refuses_a_json_document_that_is_not_an_object():
         cli._read_config()
 
 
-def test_write_config_preserves_an_existing_files_mode():
-    """The rewrite goes through a temp file `mkstemp` creates at 0600, so without carrying the original's mode over
-    an ordinary write would silently re-permission the file."""
+def test_brolly_creates_its_own_directory_0700_with_0600_files():
+    """Nothing in `~/.aws/brolly` is secret — a session name, an ISO expiry, a boolean, a backend path — but it
+    sits next to botocore's own 0600 `~/.aws/sso/cache`, and being the loose file in the room is a downgrade
+    nobody chose. Both files brolly writes there are covered: its config, and an expiry sidecar."""
+    cli._write_config({'keyring_backend': 'x.Y'})
+    keychain._write_sidecar(_SESSION, keychain._cache_key(_SESSION), '2026-07-27T00:00:00+00:00', True)
+
+    directory = cli._config_path().parent
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(cli._config_path().stat().st_mode) == 0o600
+    assert stat.S_IMODE(keychain._sidecar_path(keychain._cache_key(_SESSION)).stat().st_mode) == 0o600
+
+
+def test_writing_tightens_a_directory_and_a_file_an_older_brolly_left_loose():
+    """A mode chosen now only reaches the users who install brolly now unless existing state is tightened too —
+    every one of these was created 0755/0644 by a brolly that never thought about it."""
     cli._write_config({'keyring_backend': 'x.Y'})
     path = cli._config_path()
-    path.chmod(0o640)
+    path.parent.chmod(0o755)
+    path.chmod(0o644)
 
     cli._write_config({'keyring_backend': 'z.W'})
 
-    assert stat.S_IMODE(path.stat().st_mode) == 0o640
-    assert cli._read_config() == {'keyring_backend': 'z.W'}
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert cli._read_config() == {'keyring_backend': 'z.W'}  # tightened, and still the file it was rewriting
+
+
+def test_atomic_write_still_preserves_the_mode_of_a_file_that_is_not_brollys(tmp_path):
+    """The other side of that rule. `~/.aws/config` is the AWS CLI's file, brolly only edits lines in it — the
+    rewrite goes through a temp file `mkstemp` creates at 0600, so without carrying the original's mode over it
+    would silently re-permission a file whose mode was the user's to choose."""
+    config = tmp_path / 'config'
+    config.write_text('[profile corp-prod]\n')
+    config.chmod(0o644)
+
+    cli._atomic_write(config, '[profile corp-prod]\nregion = us-east-1\n')
+
+    assert stat.S_IMODE(config.stat().st_mode) == 0o644
+    assert config.read_text().endswith('region = us-east-1\n')
 
 
 def test_write_config_leaves_the_original_file_intact_when_the_write_fails(monkeypatch):
