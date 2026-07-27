@@ -384,6 +384,12 @@ def cmd_switch(profile: ProfileName) -> None:
     print(f'\n{_ORANGE}{_CHECK}{_RESET}  {profile} → {account_id} ({account["accountName"]}) / {role}')
 
 
+def _require_new_profile(new_profile: ProfileName, full_config: AwsConfig) -> None:
+    """Exit if `add`'s target name is taken — checked at dispatch too, before the secure door mutates anything."""
+    if new_profile in full_config['profiles']:
+        raise SystemExit(f"profile '{new_profile}' already exists — use `brolly switch` to repoint it")
+
+
 def _create_profile_skeleton(session: SessionName, new_profile: ProfileName, full_config: AwsConfig) -> Region:
     """Write the session/region/output of a new profile, mirroring a sibling under the same session.
 
@@ -392,8 +398,7 @@ def _create_profile_skeleton(session: SessionName, new_profile: ProfileName, ful
     """
     profiles = full_config['profiles']
     _require_known_session(session, full_config)
-    if new_profile in profiles:
-        raise SystemExit(f"profile '{new_profile}' already exists — use `brolly switch` to repoint it")
+    _require_new_profile(new_profile, full_config)
 
     sso_region: Region = full_config['sso_sessions'][session]['sso_region']
     sibling = next((p for p in profiles.values() if p.get('sso_session') == session), {})
@@ -455,13 +460,16 @@ def _session_is_secure(session_name: SessionName, full_config: AwsConfig) -> boo
 
 def _enter_secure_session(session_name: SessionName, full_config: AwsConfig) -> ModuleType:
     """The single door into the keychain paths — returns the keychain module, having run what every secure
-    command owes the session first: back-fill the secured-session record (for one secured by an older brolly),
-    heal any profile left in stock shape, then clear the plaintext token that healing made redundant. None of the
-    three may wait for a command that actually authenticates, and the order is load-bearing — healing is what
-    removes the last reader of the blob, so the purge after it needs no exception.
+    command owes the session first: prove the keychain is reachable, back-fill the secured-session record (for one
+    secured by an older brolly), heal any profile left in stock shape, then clear the plaintext token that healing
+    made redundant. None of the four may wait for a command that actually authenticates, and the order is
+    load-bearing — the preflight comes first because everything after it rewrites ~/.aws or deletes a token on the
+    strength of a keychain that must therefore be known to work, and healing is what removes the last reader of
+    the blob, so the purge after it needs no exception.
     """
     from brolly import keychain
 
+    keychain.preflight_keychain(session_name)
     _record_secured_session(session_name, True)
     keychain.heal_session_profiles(session_name, full_config)
     keychain.purge_session_plaintext(session_name, full_config)
@@ -479,31 +487,26 @@ def _secure_mode_tip(session_name: SessionName, full_config: AwsConfig) -> None:
     )
 
 
-def _unsecured_profile_error(profile: ProfileName, session: SessionName, cfg: AwsConfig) -> str:
+def _unsecured_profile_error(profile: ProfileName, session: SessionName) -> str:
     """Why a profile that is not in secure shape under a secured session resolves nothing, and what fixes it.
 
-    Dispatch heals every stock profile before the command runs, so the live case is the one healing cannot touch:
-    a profile with no account/role to move, which only picking one can finish.
+    Dispatch heals every stock profile before the command runs, and a profile healing could not convert keeps its
+    secure keys (so it never reaches this), leaving one live case: a profile with no account/role to move, which
+    only picking one can finish.
     """
-    if not (cfg.get('sso_account_id') and cfg.get('sso_role_name')):
-        return (
-            f"profile '{profile}' has no account/role set, so nothing can resolve credentials for it.\n"
-            f'  Finish it:  AWS_PROFILE={profile} brolly switch  '
-            f"— under the secured session '{session}' it will be written in secure shape"
-        )
     return (
-        f"profile '{profile}' still carries the stock sso_account_id/sso_role_name while its session '{session}' "
-        f'is secured, so it looks for credentials in ~/.aws/sso/cache — which secure mode deliberately keeps '
-        f'empty. Logging in again cannot fix it.\n'
-        f'  Convert it:  brolly secure enable -s {session}\n'
-        f'  Or move the whole session back to the plaintext cache:  brolly secure disable -s {session}'
+        f"profile '{profile}' has no account/role set, so nothing can resolve credentials for it.\n"
+        f'  Finish it:  AWS_PROFILE={profile} brolly switch  '
+        f"— under the secured session '{session}' it will be written in secure shape"
     )
 
 
-def cmd_refresh(
-    target_profile: ProfileName, session: SessionName, full_config: AwsConfig, secure: bool = False
-) -> None:
-    """Verify the profile's credentials, re-logging in only if they are gone — `secure` is the session's mode."""
+def _require_profile_in_session(target_profile: ProfileName, session: SessionName, full_config: AwsConfig) -> None:
+    """Exit unless the profile exists, is an SSO profile, and belongs to the asserted session. Pure: never writes.
+
+    Dispatch runs this *before* it opens the secure door, so a mistyped `-s` fails without having first healed and
+    purged the session it named.
+    """
     profiles = full_config['profiles']
     if target_profile not in profiles:
         raise SystemExit(f"unknown profile '{target_profile}' — available: {', '.join(sorted(profiles))}")
@@ -516,7 +519,15 @@ def cmd_refresh(
         )
     if actual not in full_config['sso_sessions']:
         raise SystemExit(f"sso-session '{actual}' referenced by '{target_profile}' is not defined")
-    sso_region: Region = full_config['sso_sessions'][actual]['sso_region']
+
+
+def cmd_refresh(
+    target_profile: ProfileName, session: SessionName, full_config: AwsConfig, secure: bool = False
+) -> None:
+    """Verify the profile's credentials, re-logging in only if they are gone — `secure` is the session's mode."""
+    _require_profile_in_session(target_profile, session, full_config)
+    profiles = full_config['profiles']
+    sso_region: Region = full_config['sso_sessions'][session]['sso_region']
     account_id: AccountId | None = profiles[target_profile].get('sso_account_id')
     check = subprocess.run(
         ['aws', 'sts', 'get-caller-identity', '--profile', target_profile, '--query', 'Arn', '--output', 'text'],
@@ -526,14 +537,14 @@ def cmd_refresh(
     if check.returncode != 0:
         if secure and not _is_secure(profiles[target_profile]):
             # no amount of logging in fixes a profile that resolves nowhere, so say what is actually wrong
-            raise SystemExit(_unsecured_profile_error(target_profile, actual, profiles[target_profile]))
+            raise SystemExit(_unsecured_profile_error(target_profile, session))
         print(f'{target_profile}: credentials unavailable — logging in…', file=sys.stderr)
         if secure:
             from brolly import keychain
 
-            keychain.cmd_secure_login(actual, full_config)
+            keychain.cmd_secure_login(session, full_config)
         else:
-            cmd_login(actual)
+            cmd_login(session)
         arn = _aws(
             'sts', 'get-caller-identity', '--profile', target_profile, '--query', 'Arn', '--output', 'text'
         ).stdout.strip()
@@ -883,7 +894,9 @@ def main(argv: list[str]) -> None:
     current: ProfileName = os.environ.get('AWS_PROFILE', 'default')
     full_config: AwsConfig = botocore.session.Session().full_config
     # Every branch below routes on the *session's* mode, so a secured session never falls back to a plaintext path
-    # (which would write a fresh token — refresh token and all — back into ~/.aws/sso/cache).
+    # (which would write a fresh token — refresh token and all — back into ~/.aws/sso/cache). Each also finishes
+    # validating its arguments before `_enter_secure_session`, which rewrites ~/.aws/config and deletes a token:
+    # a command that is about to fail must not heal and purge a session on its way to failing.
     if args.cmd == 'login':
         session = _require_known_session(_session_in_context(current, full_config, args.session), full_config)
         if _session_is_secure(session, full_config):
@@ -896,17 +909,21 @@ def main(argv: list[str]) -> None:
         # unresolved when it names none, so cmd_switch can raise its own profile-shaped error
         session = full_config['profiles'].get(current, {}).get('sso_session')
         if session and _session_is_secure(session, full_config):
+            _require_known_session(session, full_config)
             _enter_secure_session(session, full_config).cmd_secure_switch(current, full_config)
         else:
             cmd_switch(current)
     elif args.cmd == 'refresh':
         session = _session_in_context(current, full_config, args.session)
+        target = args.profile or current
+        _require_profile_in_session(target, session, full_config)
         secure = _session_is_secure(session, full_config)
         if secure:
             _enter_secure_session(session, full_config)
-        cmd_refresh(args.profile or current, session, full_config, secure)
+        cmd_refresh(target, session, full_config, secure)
     elif args.cmd == 'add':
-        session = _session_in_context(current, full_config, args.session)
+        session = _require_known_session(_session_in_context(current, full_config, args.session), full_config)
+        _require_new_profile(args.profile, full_config)
         if _session_is_secure(session, full_config):
             _enter_secure_session(session, full_config).cmd_secure_add(session, args.profile, full_config)
         else:

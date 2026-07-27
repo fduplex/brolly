@@ -219,11 +219,14 @@ def _write_session_config(
 
 @pytest.fixture
 def dispatch_env(tmp_path, monkeypatch):
-    """An isolated ~/.aws/config plus a stubbed `_require_aws` — dispatch itself never needs the real `aws` CLI."""
+    """An isolated ~/.aws/config plus stubs for the two things dispatch needs from outside: the real `aws` CLI, and
+    a reachable OS keychain (`_enter_secure_session` proves the backend works before it rewrites anything, and no
+    test machine is guaranteed one)."""
     monkeypatch.setenv('AWS_CONFIG_FILE', str(tmp_path / 'config'))
     monkeypatch.setenv('HOME', str(tmp_path))
     monkeypatch.delenv('AWS_PROFILE', raising=False)
     monkeypatch.setattr(cli, '_require_aws', lambda: None)
+    monkeypatch.setattr(keychain, 'preflight_keychain', lambda session_name: None)
     return tmp_path / 'config'
 
 
@@ -555,12 +558,137 @@ def test_a_skeleton_never_activates_the_sso_credential_provider(dispatch_env):
     assert builder._create_sso_provider(_SKELETON).load() is None
 
 
-# --- cmd_refresh on a stock profile under a secured session --------------------------------------
+# --- nothing is mutated before the command is known to be able to run -----------------------------
+
+
+def _never_runs(*_a: object, **_k: object) -> None:
+    raise AssertionError('no command body may run once dispatch has decided the command cannot proceed')
+
+
+@pytest.mark.parametrize('argv', [pytest.param([], id='bare-brolly'), pytest.param(['refresh'], id='refresh')])
+def test_an_unusable_keychain_stops_a_secured_session_before_anything_is_mutated(argv, tmp_path, monkeypatch):
+    """`_enter_secure_session` proves the keychain is reachable *first*: everything after the preflight rewrites
+    ~/.aws/config, records the session or deletes a token on the strength of a backend that must therefore be known
+    to work. Deliberately does not use `dispatch_env`, whose no-op `preflight_keychain` stub hides that ordering —
+    a run that cannot reach the keychain must leave the session exactly as it found it.
+    """
+    config = tmp_path / 'config'
+    _write_mixed_session_config(config)
+    before = config.read_text()
+    plaintext = _plant_plaintext(_SESSION)
+    monkeypatch.setenv('AWS_PROFILE', _PROFILE)
+    monkeypatch.setattr(cli, '_require_aws', lambda: None)
+    monkeypatch.setattr(cli, 'cmd_refresh', _never_runs)
+
+    def unusable(_session_name: str) -> None:
+        raise SystemExit('no OS keychain backend is available')
+
+    monkeypatch.setattr(keychain, 'preflight_keychain', unusable)
+
+    with pytest.raises(SystemExit, match='no OS keychain backend'):
+        cli.main(argv)
+
+    assert config.read_text() == before  # not healed: the stock sibling still carries its stock keys
+    assert plaintext.read_text() == '{"accessToken": "stale", "refreshToken": "leaked"}'  # not purged
+    assert cli._secured_sessions() == set()  # not recorded
+    assert not cli._config_path().exists()
+
+
+def test_refresh_under_the_wrong_session_fails_before_it_heals_or_purges(dispatch_env, monkeypatch):
+    """Arguments are validated before the secure door opens: a mistyped `-s` names a session brolly would otherwise
+    heal and purge on its way to failing — mutating a session the user never meant to operate on."""
+    dispatch_env.write_text(
+        '\n'.join([
+            f'[sso-session {_SESSION}]',
+            'sso_start_url = https://corp.awsapps.com/start',
+            'sso_region = us-east-1',
+            '',
+            f'[profile {_PROFILE}]',
+            f'sso_session = {_SESSION}',
+            'brolly_sso_account_id = 111111111111',
+            'brolly_sso_role_name = AdministratorAccess',
+            f'credential_process = brolly credential-process --profile {_PROFILE}',
+            '',
+            f'[profile {_STOCK}]',
+            f'sso_session = {_SESSION}',
+            f'sso_account_id = {_STOCK_ACCOUNT}',
+            'sso_role_name = ReadOnly',
+            '',
+            '[sso-session other]',
+            'sso_start_url = https://other.awsapps.com/start',
+            'sso_region = us-east-1',
+            '',
+            '[profile other-prod]',
+            'sso_session = other',
+            'sso_account_id = 888888888888',
+            'sso_role_name = ReadOnly',
+            '',
+        ])
+    )
+    before = dispatch_env.read_text()
+    plaintext = _plant_plaintext(_SESSION)
+    monkeypatch.setattr(cli, 'cmd_refresh', _never_runs)
+
+    with pytest.raises(SystemExit, match="profile 'other-prod' is under session 'other'"):
+        cli.main(['refresh', 'other-prod', '-s', _SESSION])
+
+    assert dispatch_env.read_text() == before
+    assert plaintext.exists()
+    assert cli._secured_sessions() == set()
+
+
+def test_add_of_an_existing_profile_fails_before_it_heals_or_purges(dispatch_env, monkeypatch):
+    """Same rule for `add`: the name clash is knowable without touching anything, so nothing is touched."""
+    _write_mixed_session_config(dispatch_env)
+    before = dispatch_env.read_text()
+    plaintext = _plant_plaintext(_SESSION)
+    monkeypatch.setattr(keychain, 'cmd_secure_add', _never_runs)
+
+    with pytest.raises(SystemExit, match=f"profile '{_PROFILE}' already exists"):
+        cli.main(['add', _PROFILE, '-s', _SESSION])
+
+    assert dispatch_env.read_text() == before
+    assert plaintext.exists()
+    assert cli._secured_sessions() == set()
+
+
+def test_switch_under_an_undefined_session_fails_before_it_heals_or_purges(dispatch_env, monkeypatch):
+    """`switch` takes its session from the current profile, so an undefined one is a config error rather than a
+    typo — and still not a reason to have already rewritten the profiles under it."""
+    dispatch_env.write_text(
+        '\n'.join([
+            f'[profile {_PROFILE}]',
+            'sso_session = ghost',
+            'brolly_sso_account_id = 111111111111',
+            'brolly_sso_role_name = AdministratorAccess',
+            f'credential_process = brolly credential-process --profile {_PROFILE}',
+            '',
+            f'[profile {_STOCK}]',
+            'sso_session = ghost',
+            f'sso_account_id = {_STOCK_ACCOUNT}',
+            'sso_role_name = ReadOnly',
+            '',
+        ])
+    )
+    before = dispatch_env.read_text()
+    plaintext = _plant_plaintext('ghost')
+    monkeypatch.setenv('AWS_PROFILE', _PROFILE)
+    monkeypatch.setattr(keychain, 'cmd_secure_switch', _never_runs)
+
+    with pytest.raises(SystemExit, match="unknown sso-session 'ghost'"):
+        cli.main(['switch'])
+
+    assert dispatch_env.read_text() == before
+    assert plaintext.exists()
+
+
+# --- cmd_refresh on a profile that is not in secure shape under a secured session -----------------
 
 
 def test_refresh_points_a_skeleton_under_a_secured_session_at_switch(monkeypatch):
-    """Healing converts every stock profile before `refresh` runs, so the skeleton is the case that survives — and
-    `secure enable` cannot finish it either, so the message has to name the command that can."""
+    """Healing converts every stock profile before `refresh` runs, and one it could not convert keeps its brolly
+    keys and so reads as secure — which leaves the skeleton as the only case that reaches this, and `secure enable`
+    cannot finish that either, so the message has to name the command that can."""
     monkeypatch.setattr(cli.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a, 1, stdout='', stderr=''))
     full_config = _full_config({_SESSION: 'us-east-1'}, {_SKELETON: {'sso_session': _SESSION}})
 
@@ -571,19 +699,3 @@ def test_refresh_points_a_skeleton_under_a_secured_session_at_switch(monkeypatch
     assert _SKELETON in message
     assert 'brolly switch' in message
     assert 'secure enable' not in message  # it would report this profile as left alone, not fix it
-
-
-def test_refresh_reports_a_stock_profile_under_a_secured_session_by_name(monkeypatch):
-    """Fix 3: a stock profile under a secured session reads the now-empty plaintext cache, so logging in again
-    cannot fix it — the error must name the profile, the session, and a concrete fix instead of retrying and
-    surfacing botocore's raw SSOTokenLoadError."""
-    monkeypatch.setattr(cli.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a, 1, stdout='', stderr=''))
-    full_config = _full_config({_SESSION: 'us-east-1'}, {_PROFILE: _plain_profile(_SESSION)})
-
-    with pytest.raises(SystemExit) as exc_info:
-        cli.cmd_refresh(_PROFILE, _SESSION, full_config, secure=True)
-
-    message = str(exc_info.value)
-    assert _PROFILE in message
-    assert _SESSION in message
-    assert 'brolly secure enable' in message  # a concrete fix, not just a diagnosis

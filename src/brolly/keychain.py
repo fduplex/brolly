@@ -304,6 +304,14 @@ def purge_session_plaintext(session_name: SessionName, full_config: AwsConfig | 
     _purge_plaintext_token(session_name)
 
 
+def _keyring_call(keyring_module: ModuleType, operation: Any, *args: str) -> Any:
+    """Run a keyring operation, turning any backend failure into a clean exit rather than a traceback."""
+    try:
+        return operation(*args)
+    except keyring_module.errors.KeyringError as x:
+        raise SystemExit(f'OS keychain access failed: {x}') from None
+
+
 @contextmanager
 def _quiet_stderr() -> Any:
     """Silence fd-level stderr for a keyring read: the `pass` backend prints "not in the password store" on a
@@ -320,6 +328,19 @@ def _quiet_stderr() -> Any:
         os.close(saved)
 
 
+def preflight_keychain(session_name: SessionName) -> ModuleType:
+    """Prove the keychain is reachable *before* a caller mutates anything on the strength of it.
+
+    Loading a backend is not the same as being able to use one: a saved backend whose package is gone, or a `pass`
+    store whose gpg-agent cannot unlock headless, only fails on the first real operation. So this does one — a read
+    of the session's own entry, hit or miss — and lets its SystemExit out while ~/.aws is still untouched.
+    """
+    keyring_module = _configured_keyring()
+    with _quiet_stderr():
+        _keyring_call(keyring_module, keyring_module.get_password, _KEYRING_SERVICE, _cache_key(session_name))
+    return keyring_module
+
+
 class _KeychainTokenCache:
     """Dict-like SSO token cache backed by the OS keychain — a drop-in for botocore's ``JSONFileCache``.
 
@@ -333,11 +354,7 @@ class _KeychainTokenCache:
         self._session_name = session_name
 
     def _run(self, operation: Any, *args: str) -> Any:
-        """Run a keyring operation, turning any backend failure into a clean exit rather than a traceback."""
-        try:
-            return operation(*args)
-        except self._keyring.errors.KeyringError as x:
-            raise SystemExit(f'OS keychain access failed: {x}') from None
+        return _keyring_call(self._keyring, operation, *args)
 
     def __contains__(self, cache_key: str) -> bool:
         with _quiet_stderr():
