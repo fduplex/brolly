@@ -28,12 +28,19 @@ shells out to `aws sso login` (or otherwise writes the plaintext cache) without 
 will silently overwrite a secured session's refresh token in `~/.aws/sso/cache`, which is the bug this dispatch
 rule exists to prevent.
 
-`cli._enter_secure_session` is the one door into the keychain paths, and its three steps are ordered: back-fill
-the secured-session record, `keychain.heal_session_profiles` (which shares `_reshape_session_profiles` with
-`secure enable`, so the two can't disagree), then `purge_session_plaintext`. Healing removes the last profile
-reading the plaintext blob, which is what lets the purge run unconditionally — reorder them and the purge starts
-refusing again. `credential-process` shares the purge but never heals: it is non-interactive and must not rewrite
-`~/.aws/config`, and it is the only path where `purge_session_plaintext`'s stock-profile guard still fires.
+`cli._enter_secure_session` is the one door into the keychain paths, and its four steps are ordered:
+`keychain.preflight_keychain`, back-fill the secured-session record, `keychain.heal_session_profiles` (which
+shares `_reshape_session_profiles` with `secure enable`, so the two can't disagree), then `purge_session_plaintext`.
+The preflight runs first because every step after it mutates state — rewriting `~/.aws/config`, deleting a token —
+on the strength of a keychain that must therefore be known to work before any of that happens. Healing removes the
+last profile reading the plaintext blob, which is what lets the purge run unconditionally — reorder that pair and
+the purge starts refusing again. `secure enable` reshapes then purges in the same order and for the same reason:
+it used to purge unconditionally *before* reshaping, which was only safe on the assumption that reshaping always
+converts every profile it touches. Now that a conversion can fail and leave a profile in stock shape (an
+`aws configure set` that doesn't stick, an odd section header), purging first could delete the blob out from under
+it — so `secure enable` reshapes, verifying each conversion, then purges through the same guarded
+`purge_session_plaintext` every other path uses. `credential-process` shares that guard but never heals: it is
+non-interactive and must not rewrite `~/.aws/config`, and it is the only path where the guard still fires by design.
 
 ## Regenerating the README illustrations
 

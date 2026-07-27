@@ -240,8 +240,9 @@ clean, complete undo.
 - **The token** (with its refresh token) lives in the keychain under service `brolly-sso`, keyed the way botocore
   keys its own cache. brolly plugs a keychain-backed cache into botocore's token provider, so **silent refresh
   still happens** — no reimplementation, just a different vault. The device login registers its OIDC client for
-  the `refresh_token` grant with the `sso:account:access` scope, which is what makes IAM Identity Center hand back
-  a refresh token at all.
+  the `refresh_token` grant, so botocore's token provider can renew the access token silently instead of hitting a
+  hard wall at 8 hours, and always asks for the `sso:account:access` scope — brolly needs it regardless, for the
+  `list_accounts`/`get_role_credentials` calls behind `switch` and `add`.
 - **A secured profile** keeps `sso_session` but moves `sso_account_id` / `sso_role_name` under `brolly_sso_*` and
   adds `credential_process`. That combination deactivates botocore's built-in SSO credential provider so
   resolution flows through brolly — otherwise botocore would find the now-absent plaintext token and fail.
@@ -249,7 +250,9 @@ clean, complete undo.
   same file that holds the chosen keychain backend). That record, not profile shape, is the authoritative answer:
   a session whose profiles are all incomplete skeletons — or which has none yet — still reads as secured, so the
   next `login` can't write a fresh refresh token back to `~/.aws/sso/cache`. Scanning profiles for `brolly_sso_*`
-  is a fallback, for a session secured by an older brolly that wrote no record.
+  is a fallback, for a session secured by an older brolly that wrote no record. Because that record is
+  authoritative, brolly refuses to guess around it: a `config.json` that exists but won't parse, or won't write,
+  stops the command rather than silently treating the session as unsecured.
 - **Entering a secured session clears stale plaintext.** `login`, `switch`, `refresh`, `add`, and bare `brolly`
   drop a leftover `~/.aws/sso/cache` blob before doing anything else. A profile still carrying the stock
   `sso_account_id`/`sso_role_name` is converted immediately beforehand — it would otherwise resolve credentials

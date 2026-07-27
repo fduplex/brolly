@@ -64,10 +64,9 @@ _DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code'
 _REFRESH_GRANT = 'refresh_token'
 _CLIENT_NAME = 'brolly'
 
-# IAM Identity Center only returns a refresh token when the client registration asks for at least this scope, and
-# only issues one at all when the registration declares the refresh_token grant. Without both, CreateToken hands
-# back a bare 8-hour access token that botocore cannot renew — the session then dies at 8h no matter how long the
-# access-portal session duration is set to. brolly needs this scope anyway to list accounts and roles.
+# The scope brolly's own registration always asks for: listing accounts and roles and vending credentials all
+# require it, so it is never optional here. It is registered alongside the refresh_token grant — which is what
+# lets botocore's token provider renew a session without a browser, and what the blob needs a refreshToken for.
 _ACCOUNT_SCOPE = 'sso:account:access'
 
 _NO_KEYRING_BACKEND = (

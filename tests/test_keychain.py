@@ -935,8 +935,9 @@ def test_device_login_stores_blob_and_sidecar(aws_env, monkeypatch):
 
 
 def test_device_login_registers_for_the_refresh_token_grant(aws_env, monkeypatch):
-    """Load-bearing: without this scope and grant, IAM Identity Center returns no refresh token and the session
-    is stranded at the access token's 8 hours regardless of the configured access-portal session duration."""
+    """brolly drives its own device login, so its own registration has to declare what it needs: the account scope
+    it uses to list accounts and roles, and the refresh_token grant a blob carrying a refreshToken is redeemed
+    under — without which botocore cannot renew and the session ends at the access token's 8 hours."""
     monkeypatch.setenv('AWS_CONFIG_FILE', str(aws_env))
     fake_oidc = _FakeOidc()
     _login(monkeypatch, _FakeKeyring(), oidc=fake_oidc)
