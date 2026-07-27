@@ -6,6 +6,7 @@ tests drive `cli.main` end to end with monkeypatched command functions and asser
 down `_session_is_secure` itself, including the self-healing mixed-session case.
 """
 
+import stat
 import subprocess
 
 import botocore.session
@@ -106,14 +107,78 @@ def test_secured_sessions_tolerates_a_malformed_config():
     assert cli._secured_sessions() == {'corp', 'zeta'}
 
 
-def test_record_secured_session_is_best_effort_when_the_config_dir_is_unwritable(tmp_path):
-    """`_record_secured_session` must never raise — brolly's own config is a nicety, not something worth failing
-    a command over. Blocking the `brolly/` directory with a plain file makes the mkdir it needs fail with OSError,
-    which the real code wraps in `suppress(OSError)`."""
+def test_read_config_refuses_to_read_a_corrupt_config_as_an_empty_one():
+    """Absent and unreadable are different answers. An absent config legitimately means "nothing is secured"; a
+    corrupt one means brolly cannot tell — and answering "nothing" would route a secured session down the plaintext
+    path, whose `login` writes a fresh refresh token into ~/.aws/sso/cache. So it fails loudly instead."""
+    assert cli._read_config() == {}  # absent: legitimately empty
+
+    path = cli._config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"secured_sessions": ["corp"\n')  # truncated mid-write: not JSON at all
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli._read_config()
+
+    assert str(path) in str(exc_info.value)  # names the file the user has to repair or delete
+
+
+def test_read_config_refuses_a_json_document_that_is_not_an_object():
+    """Well-formed JSON of the wrong shape is just as unusable: `.get(...)` on a list raises, and treating it as
+    empty would hide a config brolly is about to overwrite."""
+    path = cli._config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('["corp", "zeta"]\n')
+
+    with pytest.raises(SystemExit, match='does not contain a JSON object'):
+        cli._read_config()
+
+
+def test_write_config_preserves_an_existing_files_mode():
+    """The rewrite goes through a temp file `mkstemp` creates at 0600, so without carrying the original's mode over
+    an ordinary write would silently re-permission the file."""
+    cli._write_config({'keyring_backend': 'x.Y'})
+    path = cli._config_path()
+    path.chmod(0o640)
+
+    cli._write_config({'keyring_backend': 'z.W'})
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert cli._read_config() == {'keyring_backend': 'z.W'}
+
+
+def test_write_config_leaves_the_original_file_intact_when_the_write_fails(monkeypatch):
+    """The point of writing through a temp file: a write that dies part-way leaves the previous config, never a
+    truncated one — a half-written record of which sessions are secured is exactly the file `_read_config` would
+    then have to refuse to read."""
+    cli._write_config({'keyring_backend': 'x.Y', 'secured_sessions': [_SESSION]})
+    path = cli._config_path()
+    original = path.read_text()
+
+    def boom(*_args: object) -> None:
+        raise OSError('no space left on device')
+
+    monkeypatch.setattr(cli.os, 'replace', boom)
+
+    with pytest.raises(OSError):
+        cli._write_config({'keyring_backend': 'z.W'})
+
+    assert path.read_text() == original
+    assert cli._secured_sessions() == {_SESSION}  # still readable, still saying what it said
+    assert list(path.parent.iterdir()) == [path]  # and no temp file left lying next to it
+
+
+def test_record_secured_session_says_so_when_the_config_dir_is_unwritable(tmp_path):
+    """A record brolly cannot write is not a nicety to swallow: the record is what routes a session to the keychain,
+    so a silent failure ends with `secure enable` reporting success over a session the next `login` treats as
+    plaintext. Blocking the `brolly/` directory with a plain file makes the mkdir it needs fail with OSError."""
     (tmp_path / 'brolly').write_text('not a directory')
 
-    cli._record_secured_session(_SESSION, True)  # must not raise
+    with pytest.raises(SystemExit) as exc_info:
+        cli._record_secured_session(_SESSION, True)
 
+    assert _SESSION in str(exc_info.value)
+    assert str(tmp_path / 'brolly') in str(exc_info.value)  # names the file the user has to fix
     assert _SESSION not in cli._secured_sessions()  # the write never landed
 
 

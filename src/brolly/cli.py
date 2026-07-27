@@ -41,9 +41,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import termios
 import tty
-from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
@@ -135,20 +135,51 @@ def _config_path() -> Path:
     return _aws_dir() / 'brolly' / 'config.json'
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Replace a file's contents in one step — an interrupted write leaves the old file, never a truncated one.
+
+    The temp file is created in the target's own directory so ``os.replace`` is a rename within one filesystem, and
+    an existing file's mode is carried over so rewriting ~/.aws/config never narrows it to the temp file's 0600.
+    """
+    fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f'.{path.name}.', suffix='.tmp')
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(text)
+        if path.exists():
+            shutil.copymode(path, temp)
+        os.replace(temp, path)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+
+
 def _read_config() -> dict[str, Any]:
+    """brolly's own config. Absent is legitimately empty; present-but-unreadable is not, and must not read as one.
+
+    This file is the authoritative record of which sessions are secured. Treating a corrupt or unreadable one as
+    "nothing is secured" would send a secured session down the plaintext path, whose `login` writes a fresh refresh
+    token into ~/.aws/sso/cache — the leak the record exists to close. So it fails loudly instead.
+    """
     path = _config_path()
     if not path.is_file():
         return {}
     try:
-        return json.loads(path.read_text())
-    except OSError, ValueError:
-        return {}
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as x:
+        raise SystemExit(
+            f'{path} is unreadable ({x}), so brolly cannot tell which sso-sessions are secured and will not '
+            f'guess.\n  Repair it, or delete it and re-run:  brolly secure enable -s <session>'
+        ) from None
+    if not isinstance(data, dict):
+        raise SystemExit(f'{path} does not contain a JSON object — repair or delete it')
+    return data
 
 
 def _write_config(data: dict[str, Any]) -> None:
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + '\n')
+    _atomic_write(path, json.dumps(data, indent=2) + '\n')
 
 
 def _secured_sessions() -> set[SessionName]:
@@ -157,18 +188,25 @@ def _secured_sessions() -> set[SessionName]:
 
 
 def _record_secured_session(session_name: SessionName, secured: bool) -> None:
-    """Add or drop the session in brolly's own record of which sessions are secured. Best-effort, never fatal.
+    """Add or drop the session in brolly's own record of which sessions are secured.
 
     The record is what makes secure-ness detectable when *no* profile carries the secure shape — a session whose
     profiles are all skeletons, or which has none at all. Its token is in the keychain either way, and without this
-    the session would read as plaintext and the next `login` would write a fresh refresh token back to disk.
+    the session would read as plaintext and the next `login` would write a fresh refresh token back to disk. A
+    record brolly cannot write is therefore not a nicety to swallow: it is the difference between the two modes.
     """
     sessions = _secured_sessions()
     updated = sessions | {session_name} if secured else sessions - {session_name}
     if updated == sessions:
         return
-    with suppress(OSError):
+    try:
         _write_config({**_read_config(), _SECURED_SESSIONS: sorted(updated)})
+    except OSError as x:
+        state = 'secured' if secured else 'no longer secured'
+        raise SystemExit(
+            f"brolly could not record session '{session_name}' as {state} in {_config_path()}: {x}\n"
+            f'  Until that file is writable, brolly cannot be trusted to route this session to the OS keychain.'
+        ) from None
 
 
 def _require_aws() -> None:
