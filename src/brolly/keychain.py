@@ -214,9 +214,9 @@ def _remove_plaintext_token(session_name: SessionName) -> bool:
 def _purge_plaintext_token(session_name: SessionName) -> None:
     """Drop any plaintext blob for a secured session, saying so — silence would hide that a token was on disk.
 
-    Unconditional, and only two callers may be: a completed device login and `secure enable`, both of which have
-    just put a fresh token in the keychain — and enable converts every profile that was reading the file in the
-    same run. Everything else goes through ``purge_session_plaintext``, which first checks nothing still needs it.
+    Unconditional, and only one caller may be: a completed device login, which has just put a fresh token in the
+    keychain and so has made the file it deletes stale by definition. Everything else — `secure enable` included —
+    goes through ``purge_session_plaintext``, which first checks that nothing still resolves out of it.
     """
     if _remove_plaintext_token(session_name):
         print(f"✓ removed plaintext token cache for session '{session_name}'", file=sys.stderr)
@@ -231,15 +231,54 @@ def _stock_profiles(session_name: SessionName, full_config: AwsConfig) -> list[P
     )
 
 
+# A private, synthetic key ``_reshape_session_profiles`` stashes onto the caller's ``full_config`` dict — never a
+# real botocore config concept, never written to disk. See ``_note_reshape_failures`` for why it has to exist.
+_RESHAPE_FAILURES_KEY = '_brolly_reshape_failures'
+
+
+def _note_reshape_failures(full_config: AwsConfig, session_name: SessionName, failed: list[ProfileName]) -> None:
+    """Record, on the caller's own ``full_config``, which profiles the reshape just run could not convert.
+
+    ``_stock_profiles`` cannot be trusted to notice this on its own: a profile whose section header confuses `aws
+    configure set` ends up with a *second* section that shadows the first, and botocore then resolves the profile
+    entirely from that second section — dropping ``sso_session`` along with the stock keys. ``_secure_profile``
+    already overwrote this profile's entry in ``full_config`` with that very (now key-less) reading, so by the time
+    anything downstream looks, the profile has become invisible to ``_session_profiles`` under this session, stock
+    keys included. The only way to hold the purge back is to have said so at the one moment the fact was still
+    known: right here, right after the reshape that discovered it.
+    """
+    full_config[_RESHAPE_FAILURES_KEY] = {**full_config.get(_RESHAPE_FAILURES_KEY, {}), session_name: list(failed)}
+
+
+def _reshape_failures(session_name: SessionName, full_config: AwsConfig | None) -> list[ProfileName]:
+    """Profiles the most recent reshape of this exact ``full_config`` failed to convert, if any.
+
+    ``None`` (a caller with nothing reshaped, e.g. ``cmd_credential_process``) and a plain dict freshly loaded from
+    disk both answer "none" — only a ``full_config`` that a reshape has actually run over and mutated in place can
+    carry this, which is exactly the set of callers this needs to affect.
+    """
+    if full_config is None:
+        return []
+    return full_config.get(_RESHAPE_FAILURES_KEY, {}).get(session_name, [])
+
+
 def purge_session_plaintext(session_name: SessionName, full_config: AwsConfig | None = None) -> None:
     """Clear a secured session's plaintext token whether or not this command authenticated — ``cli`` runs this from
     the one place that decides a session is secure, so no command can forget it.
 
-    One guard, stated rather than silent: while a stock profile is still configured under the session, botocore
-    resolves *its* credentials out of this very blob, and deleting it would break a working profile with nothing
-    but a browser login to get it back. ``cli._enter_secure_session`` heals those profiles before it purges, so no
-    user-facing command reaches this. It stands for ``cmd_credential_process``, which shares the purge but runs
-    non-interactively on every cold credential resolution and must not rewrite ``~/.aws/config`` behind the SDK.
+    Two guards, both stated rather than silent, and neither a replacement for the other:
+
+    - while a stock profile is still configured under the session, botocore resolves *its* credentials out of this
+      very blob, and deleting it would break a working profile with nothing but a browser login to get it back.
+      ``cli._enter_secure_session`` and `secure enable` both heal those profiles before they purge, so this guard
+      fires for them only on a profile healing could not convert.
+    - a profile a reshape just failed to convert may not even trip the guard above — see
+      ``_note_reshape_failures`` for the shadowed-section case that makes it invisible to ``_stock_profiles``
+      entirely — so a failed reshape holds the purge back on its own account, unconditionally.
+
+    Both stand for ``cmd_credential_process``, which shares the purge but runs non-interactively on every cold
+    credential resolution and must not rewrite ``~/.aws/config`` behind the SDK — and which never reshapes, so
+    never trips the second guard.
     """
     if not _plaintext_token_path(session_name).is_file():
         return  # the common case, and the only cost on it: one stat
@@ -249,6 +288,16 @@ def purge_session_plaintext(session_name: SessionName, full_config: AwsConfig | 
             f"! session '{session_name}' is secured, but ~/.aws/sso/cache still holds its token — "
             f'{", ".join(stock)} still resolves credentials from it, so this command left it alone.\n'
             f'  Convert it and clear the file:  brolly secure enable -s {session_name}',
+            file=sys.stderr,
+        )
+        return
+    failed = _reshape_failures(session_name, full_config)
+    if failed:
+        print(
+            f"! session '{session_name}' is secured, but ~/.aws/sso/cache still holds its token — "
+            f'{", ".join(failed)} just failed to convert to secure mode, so this command deliberately left the '
+            f'plaintext token in place rather than delete a blob that profile may still need.\n'
+            f'  Fix the profile (see the error reported above), then re-run:  brolly secure enable -s {session_name}',
             file=sys.stderr,
         )
         return
@@ -435,33 +484,42 @@ def _secure_profile(
 
 
 class _Reshaped(NamedTuple):
-    """One pass over a session's profiles: those rewritten into secure shape just now, those already in it, and
-    those carrying no account/role to move."""
+    """One pass over a session's profiles: those rewritten into secure shape just now, those already in it, those
+    carrying no account/role to move, and those whose stock keys survived the rewrite."""
 
     converted: list[ProfileName]
     already: list[ProfileName]
     skeletons: list[ProfileName]
+    failed: list[ProfileName]
 
 
 def _reshape_session_profiles(session_name: SessionName, full_config: AwsConfig) -> _Reshaped:
     """Rewrite every stock profile under the session into secure shape — the pass `secure enable` and healing share.
 
-    Mutates ``full_config`` alongside the file: both callers hand the same dict to whatever runs next.
+    Keyed on the stock keys, never on the absence of ``brolly_sso_*``: a profile can carry both shapes at once (an
+    interrupted conversion, a hand-edited config), and while it does, botocore's SSO credential provider still
+    activates on the stock pair. Treating it as already secure would leave it reading the plaintext blob under a
+    session everything else considers converted — so what makes a profile stock is exactly what ``_stock_profiles``
+    reports, and this repairs it either way.
+
+    Mutates ``full_config`` alongside the file: both callers hand the same dict to whatever runs next. A failed
+    conversion is also noted on it (see ``_note_reshape_failures``), because that same mutation is what makes the
+    profile invisible to a later ``_stock_profiles`` scan — the note is the only record left of what happened.
     """
     converted: list[ProfileName] = []
     already: list[ProfileName] = []
     skeletons: list[ProfileName] = []
+    failed: list[ProfileName] = []
     for profile, cfg in _session_profiles(session_name, full_config):
-        if _is_secure(cfg):
-            already.append(profile)
-            continue
         account_id, role = cfg.get('sso_account_id'), cfg.get('sso_role_name')
         if not (account_id and role):
-            skeletons.append(profile)  # an incomplete profile — nothing to move into brolly_sso_*
+            # nothing to move into brolly_sso_*: already secure, or an incomplete profile only `switch` can finish
+            (already if _is_secure(cfg) else skeletons).append(profile)
             continue
-        _secure_profile(profile, account_id, role, cfg.get('sso_account_name'), cfg)
-        converted.append(profile)
-    return _Reshaped(converted, already, skeletons)
+        secured = _secure_profile(profile, account_id, role, cfg.get('sso_account_name'), cfg)
+        (converted if secured else failed).append(profile)
+    _note_reshape_failures(full_config, session_name, failed)
+    return _Reshaped(converted, already, skeletons, failed)
 
 
 def heal_session_profiles(session_name: SessionName, full_config: AwsConfig) -> list[ProfileName]:
@@ -673,16 +731,20 @@ def cmd_secure_enable(session_name: SessionName, full_config: AwsConfig, backend
     # and a run that dies half-way through the rewrite below must still leave it detectable as such.
     _record_secured_session(session_name, True)
 
-    # The token is safely in the keychain now — drop the redundant plaintext copy botocore/aws-cli left behind.
-    # Unconditional here, unlike purge_session_plaintext: the reshape below converts every profile reading it.
-    _purge_plaintext_token(session_name)
-
+    # Heal first, purge second — `cli._enter_secure_session`'s order, for its reason: until the reshape has run,
+    # a stock profile is still resolving its credentials out of the blob this would delete.
     reshaped = _reshape_session_profiles(session_name, full_config)
+    purge_session_plaintext(session_name, full_config)
     converted, resolving = len(reshaped.converted), len(reshaped.converted) + len(reshaped.already)
 
     print(f"✓ secure mode on for session '{session_name}' — its token now lives in the OS keychain")
     if resolving:
         print(f'  {resolving} profile(s) resolve credentials through it ({converted} converted just now)')
+    if reshaped.failed:
+        print(
+            f'  ! could not convert, so still resolving from ~/.aws/sso/cache: {", ".join(reshaped.failed)}\n'
+            f'  fix the lines named above, then re-run — until then this session is only half in the keychain'
+        )
     if reshaped.skeletons:
         print(
             f'  no account/role set yet, so left alone: {", ".join(reshaped.skeletons)}\n'
@@ -690,6 +752,11 @@ def cmd_secure_enable(session_name: SessionName, full_config: AwsConfig, backend
         )
     elif not resolving:
         print(f'  it has no profiles yet — `brolly add <profile> -s {session_name}` creates one already secured')
+
+    if reshaped.failed:
+        # said in full above; the status is for whatever ran this — a half-enabled session still leaks a refresh
+        # token through ~/.aws/sso/cache, and a script that cannot tell that from success will not come back
+        raise SystemExit(1)
 
 
 def cmd_secure_disable(session_name: SessionName, full_config: AwsConfig) -> None:

@@ -191,6 +191,22 @@ def _live_blob() -> dict[str, str]:
     return {'accessToken': 'access-tok', 'expiresAt': (datetime.now(UTC) + timedelta(days=1)).isoformat()}
 
 
+def _plant_plaintext_token(session_name: str = _SESSION):
+    """A stale plaintext SSO blob at botocore's fixed cache path — HOME is tmp_path-isolated for every test here."""
+    path = keychain._plaintext_token_path(session_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"accessToken": "stale", "refreshToken": "leaked"}')
+    return path
+
+
+def _stub_keyring_backend(monkeypatch, keyring_module: _FakeKeyring) -> None:
+    """Point `secure enable`'s backend resolution at a fake keychain, leaving the rest of the command real."""
+    monkeypatch.setattr(keychain, '_import_keyring', lambda: keyring_module)
+    monkeypatch.setattr(keychain, '_autodetect_backend', lambda _: 'fake.Backend')
+    monkeypatch.setattr(keychain, '_select_backend', lambda *a: None)
+    monkeypatch.setattr(keychain, '_backend_label', lambda _: 'fake')
+
+
 def test_config_remove_keys_strips_only_named_keys_in_section(aws_env):
     _write_config(aws_env, secure=False)
     keychain._config_remove_keys(_PROFILE, {'sso_account_id', 'sso_role_name'})
@@ -557,6 +573,124 @@ def test_heal_session_profiles_leaves_a_skeleton_alone(aws_env, capsys):
     assert keychain._stock_profiles(_SESSION, full_config) == []  # a skeleton never held the blob back
 
 
+_BOTH_SHAPES = 'corp-halfway'
+
+
+def _write_both_shapes_config(path) -> None:
+    """One profile carrying the stock pair *and* the brolly pair — an interrupted conversion, or a hand-edit. The
+    stock pair is what botocore's SSO credential provider activates on, so it is still reading the plaintext blob
+    however secure the rest of it looks."""
+    path.write_text(
+        '\n'.join([
+            '[sso-session corp]',
+            'sso_start_url = https://corp.awsapps.com/start',
+            'sso_region = us-east-1',
+            '',
+            f'[profile {_BOTH_SHAPES}]',
+            'sso_session = corp',
+            'region = us-east-1',
+            'sso_account_id = 333333333333',
+            'sso_role_name = ReadOnly',
+            'brolly_sso_account_id = 222222222222',
+            'brolly_sso_role_name = AdministratorAccess',
+            f'credential_process = brolly credential-process --profile {_BOTH_SHAPES}',
+        ])
+        + '\n'
+    )
+
+
+def _write_shadowed_header_config(path) -> None:
+    """A one-profile session whose only profile sits under a header `aws configure set` will not recognize as the
+    existing section (two spaces where botocore's shlex-based parser sees only one). `aws configure set` then
+    appends a *second*, plain `[profile corp-prod]` section, and botocore resolves the profile entirely out of
+    that last section — dropping sso_session and the stock keys from view along with it. Nothing here is mocked:
+    this is the realistic shape that defeats `_config_remove_keys` on its own, without any monkeypatching."""
+    path.write_text(
+        '\n'.join([
+            '[sso-session corp]',
+            'sso_start_url = https://corp.awsapps.com/start',
+            'sso_region = us-east-1',
+            '',
+            f'[profile  {_PROFILE}]',  # two spaces: still this profile to botocore, not to `aws configure set`
+            'sso_session = corp',
+            'region = us-east-1',
+            f'sso_account_id = {_ACCOUNT}',
+            f'sso_role_name = {_ROLE}',
+        ])
+        + '\n'
+    )
+
+
+def test_reshape_converts_a_profile_that_carries_both_shapes_at_once(aws_env):
+    """Keyed on the stock pair, never on the absence of brolly_sso_*: this profile reads as secure and *is* still
+    resolving out of ~/.aws/sso/cache. Bucketing it as `already` left that leak open under a session everything
+    else considered converted — and told the purge there was nothing holding the blob back."""
+    _write_both_shapes_config(aws_env)
+    full_config = botocore.session.Session().full_config
+
+    reshaped = keychain._reshape_session_profiles(_SESSION, full_config)
+
+    assert reshaped == keychain._Reshaped(converted=[_BOTH_SHAPES], already=[], skeletons=[], failed=[])
+    cfg = botocore.session.Session(profile=_BOTH_SHAPES).get_scoped_config()
+    assert 'sso_account_id' not in cfg
+    assert 'sso_role_name' not in cfg
+    assert cfg['brolly_sso_account_id'] == '333333333333'  # the live pair moved, not the stale brolly one
+    assert cfg['brolly_sso_role_name'] == 'ReadOnly'
+    # the complementarity that licenses the purge: what makes a profile stock is exactly what this repaired
+    assert keychain._stock_profiles(_SESSION, full_config) == []
+
+
+def test_healing_a_both_shapes_profile_releases_the_plaintext_blob(aws_env, monkeypatch, capsys):
+    """The same case end to end: the blob stays on disk until nothing resolves out of it, and a both-shapes profile
+    did — so healing has to convert it before the purge is legitimately unblocked."""
+    _write_both_shapes_config(aws_env)
+    plaintext = _plant_plaintext_token()
+    full_config = botocore.session.Session().full_config
+
+    assert keychain.heal_session_profiles(_SESSION, full_config) == [_BOTH_SHAPES]
+    keychain.purge_session_plaintext(_SESSION, full_config)
+
+    assert not plaintext.exists()
+    assert _BOTH_SHAPES in capsys.readouterr().err  # never silent about a profile it rewrote unasked
+
+
+def test_entering_a_secured_session_leaves_the_plaintext_blob_when_healing_cannot_convert_a_profile(aws_env, capsys):
+    """The hole this closes, reached exactly the way `cli._enter_secure_session` reaches it: heal, then purge.
+    A shadowed-section profile fails the conversion `heal_session_profiles` attempts, and the very failure that
+    ``_secure_profile`` reads back replaces the caller's in-memory copy of the profile with a reading that no
+    longer even carries ``sso_session`` — invisible to ``_stock_profiles``, and so unable to hold the purge back
+    by itself. Nothing here is mocked: the bad header alone defeats ``_config_remove_keys``."""
+    _write_shadowed_header_config(aws_env)
+    plaintext = _plant_plaintext_token()
+    stale_bytes = plaintext.read_bytes()
+    full_config = botocore.session.Session().full_config
+
+    assert keychain.heal_session_profiles(_SESSION, full_config) == []  # nothing converted — it failed
+    assert keychain._stock_profiles(_SESSION, full_config) == []  # and the failure made it invisible here too
+
+    keychain.purge_session_plaintext(_SESSION, full_config)
+
+    assert plaintext.read_bytes() == stale_bytes  # left alone, byte for byte
+    err = capsys.readouterr().err
+    assert _PROFILE in err
+    assert 'deliberately left' in err
+
+
+def test_reshape_separates_a_skeleton_from_an_already_secure_profile(aws_env):
+    """The two shapes with no account/role to move look alike to the loop and must not be reported alike: one is
+    finished, the other is waiting on `brolly switch`."""
+    _write_mixed_config(aws_env, skeleton=True)
+    full_config = botocore.session.Session().full_config
+
+    reshaped = keychain._reshape_session_profiles(_SESSION, full_config)
+
+    assert reshaped == keychain._Reshaped(converted=[_STOCK], already=[_PROFILE], skeletons=[_SKELETON], failed=[])
+    assert botocore.session.Session(profile=_SKELETON).get_scoped_config() == {
+        'sso_session': _SESSION,
+        'region': 'us-east-1',
+    }
+
+
 def test_secure_profile_refuses_to_call_a_profile_converted_while_its_stock_keys_survive(aws_env, monkeypatch, capsys):
     """The blocker itself: the removal is a line edit against a file botocore parses more liberally than any matcher
     of ours, so its result is read back rather than assumed. A profile whose stock keys survived still resolves out
@@ -601,6 +735,95 @@ def test_secure_profile_reports_the_second_section_an_unusual_header_makes_aws_c
     assert _PROFILE in err
     assert 'missing sso_session' in err
     assert 'second [profile corp-prod] section' in err  # names what happened, not just that something did
+
+
+def test_secure_enable_heals_a_stock_profile_before_it_purges_the_plaintext_blob(aws_env, monkeypatch, capsys):
+    """Order, asserted on the end state: while a stock profile is under the session, the blob is what resolves its
+    credentials, so `enable` converts it first and only then deletes the file."""
+    _write_mixed_config(aws_env)
+    plaintext = _plant_plaintext_token()
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password(
+        'brolly-sso', keychain._cache_key(_SESSION), json.dumps({**_live_blob(), 'refreshToken': 'good'})
+    )
+    _stub_keyring_backend(monkeypatch, fake_keyring)
+
+    keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    cfg = botocore.session.Session(profile=_STOCK).get_scoped_config()
+    assert cfg['brolly_sso_account_id'] == '333333333333'
+    assert 'sso_account_id' not in cfg
+    assert not plaintext.exists()  # healing removed the last reader, so the purge had nothing to hold it back
+
+
+def test_secure_enable_keeps_the_plaintext_blob_when_a_profile_could_not_be_converted(aws_env, monkeypatch, capsys):
+    """The inverse of the ordering, and the reason `enable` no longer purges unconditionally: a profile whose stock
+    keys survived is still resolving out of this file, so deleting it would break a working profile with nothing
+    but a browser login to get it back."""
+    _write_mixed_config(aws_env)
+    plaintext = _plant_plaintext_token()
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password(
+        'brolly-sso', keychain._cache_key(_SESSION), json.dumps({**_live_blob(), 'refreshToken': 'good'})
+    )
+    _stub_keyring_backend(monkeypatch, fake_keyring)
+    monkeypatch.setattr(keychain, '_config_remove_keys', lambda *a, **k: None)  # a removal that does not land
+
+    with pytest.raises(SystemExit):
+        keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    assert plaintext.read_text() == '{"accessToken": "stale", "refreshToken": "leaked"}'  # untouched
+    captured = capsys.readouterr()
+    assert f'could not convert, so still resolving from ~/.aws/sso/cache: {_STOCK}' in captured.out
+    assert 'sso_account_id' in botocore.session.Session(profile=_STOCK).get_scoped_config()  # and it says so truly
+
+
+def test_secure_enable_exits_non_zero_after_reporting_a_profile_it_could_not_convert(aws_env, monkeypatch, capsys):
+    """A partial enable leaves a profile rotating a live refresh token through ~/.aws/sso/cache. The summary is
+    printed in full first — the status is for whatever ran the command, which cannot read prose."""
+    _write_mixed_config(aws_env, skeleton=True)
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password(
+        'brolly-sso', keychain._cache_key(_SESSION), json.dumps({**_live_blob(), 'refreshToken': 'good'})
+    )
+    _stub_keyring_backend(monkeypatch, fake_keyring)
+    monkeypatch.setattr(keychain, '_config_remove_keys', lambda *a, **k: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert f"secure mode on for session '{_SESSION}'" in out
+    assert f'could not convert, so still resolving from ~/.aws/sso/cache: {_STOCK}' in out
+    assert f'no account/role set yet, so left alone: {_SKELETON}' in out  # the whole summary, not a truncated one
+
+
+def test_secure_enable_leaves_the_plaintext_blob_untouched_when_a_shadowed_header_defeats_the_conversion(
+    aws_env, monkeypatch, capsys
+):
+    """The hole this closes: `_stock_profiles` alone cannot hold the purge back here, because the very failure that
+    ``_secure_profile`` reads back off disk replaces the profile's in-memory entry with a reading that has lost
+    ``sso_session`` along with the stock keys — invisible to a later scan, not just unconverted. `secure enable`
+    must not treat the absence of a `_stock_profiles` hit as license to purge. Nothing is mocked: the shadowed
+    header alone defeats ``_config_remove_keys``, the realistic path rather than a stubbed-out one."""
+    _write_shadowed_header_config(aws_env)
+    plaintext = _plant_plaintext_token()
+    stale_bytes = plaintext.read_bytes()
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password(
+        'brolly-sso', keychain._cache_key(_SESSION), json.dumps({**_live_blob(), 'refreshToken': 'good'})
+    )
+    _stub_keyring_backend(monkeypatch, fake_keyring)
+
+    with pytest.raises(SystemExit) as exc_info:
+        keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    assert exc_info.value.code == 1
+    assert plaintext.read_bytes() == stale_bytes  # left alone, byte for byte — not merely "still present"
+    err = capsys.readouterr().err
+    assert _PROFILE in err
+    assert 'deliberately left' in err
 
 
 def test_secure_enable_and_healing_share_one_pass_over_the_profiles(aws_env, monkeypatch, capsys):
