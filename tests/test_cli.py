@@ -8,6 +8,7 @@ down `_session_is_secure` itself, including the self-healing mixed-session case.
 
 import stat
 import subprocess
+from collections.abc import Sequence
 
 import botocore.session
 import pytest
@@ -436,7 +437,7 @@ def test_add_purges_a_planted_plaintext_blob_on_a_secured_session(dispatch_env, 
 # --- auto-heal at dispatch -----------------------------------------------------------------------
 
 
-def _write_mixed_session_config(path, *, stock: tuple[str, ...] = (_STOCK,), skeletons: tuple[str, ...] = ()) -> None:
+def _write_mixed_session_config(path, *, stock: Sequence[str] = (_STOCK,), skeletons: Sequence[str] = ()) -> None:
     """A secured session with one converted profile plus the shapes an upgrade can strand under it: profiles still
     carrying the stock SSO keys, and skeletons with no account/role picked yet."""
     lines = [

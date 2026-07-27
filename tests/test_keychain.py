@@ -9,6 +9,7 @@ import os
 import stat
 from datetime import UTC, datetime, timedelta
 from hashlib import sha1
+from types import ModuleType
 
 import botocore.session
 import pytest
@@ -27,8 +28,21 @@ def _isolate_brolly_config(tmp_path, monkeypatch):
     monkeypatch.setenv('HOME', str(tmp_path))
 
 
-class _FakeKeyring:
-    """Minimal in-memory stand-in for the `keyring` module (service, username) -> secret string."""
+def _fake_module(**attributes: object) -> ModuleType:
+    """A real module carrying just the attributes a keyring helper reads — the helpers are annotated ``ModuleType``,
+    and a duck-typed class object standing in for one is a lie to the type checker as much as to the reader."""
+    module = ModuleType('fake_keyring')
+    for name, value in attributes.items():
+        setattr(module, name, value)
+    return module
+
+
+class _FakeKeyring(ModuleType):
+    """Minimal in-memory stand-in for the `keyring` module (service, username) -> secret string.
+
+    A ``ModuleType`` subclass rather than a bare duck type, because every helper it is handed to is typed as taking
+    the `keyring` module itself.
+    """
 
     class errors:
         class KeyringError(Exception):
@@ -38,6 +52,7 @@ class _FakeKeyring:
             pass
 
     def __init__(self) -> None:
+        super().__init__('fake_keyring')
         self._store: dict[tuple[str, str], str] = {}
 
     def get_password(self, service: str, username: str) -> str | None:
@@ -189,6 +204,14 @@ def aws_env(tmp_path, monkeypatch):
 
 def _live_blob() -> dict[str, str]:
     return {'accessToken': 'access-tok', 'expiresAt': (datetime.now(UTC) + timedelta(days=1)).isoformat()}
+
+
+def _stored_blob(keyring_module: _FakeKeyring, session_name: str = _SESSION) -> dict:
+    """The blob the fake keychain holds for a session — asserted present before it is decoded, so a test that meant
+    to check a stored token never passes by decoding a miss."""
+    raw = keyring_module.get_password('brolly-sso', keychain._cache_key(session_name))
+    assert raw is not None
+    return json.loads(raw)
 
 
 def _plant_plaintext_token(session_name: str = _SESSION):
@@ -374,16 +397,14 @@ def test_backend_label_maps_known_and_unknown():
         cls.__module__ = 'keyring_pass'
         return cls()
 
-    fake_module = type('m', (), {'get_keyring': staticmethod(fake_get_keyring)})
-    assert keychain._backend_label(fake_module) == 'pass (gpg-agent)'
+    assert keychain._backend_label(_fake_module(get_keyring=fake_get_keyring)) == 'pass (gpg-agent)'
 
     def unknown_get_keyring():
         cls = type('WeirdBackend', (), {})
         cls.__module__ = 'some.other.vault'
         return cls()
 
-    other = type('m', (), {'get_keyring': staticmethod(unknown_get_keyring)})
-    assert keychain._backend_label(other) == 'some.other.vault.WeirdBackend'
+    assert keychain._backend_label(_fake_module(get_keyring=unknown_get_keyring)) == 'some.other.vault.WeirdBackend'
 
 
 def test_configured_keyring_reports_missing_backend(monkeypatch):
@@ -398,7 +419,7 @@ def test_configured_keyring_reports_missing_backend(monkeypatch):
 def test_configured_keyring_applies_saved_backend(monkeypatch):
     keychain._write_config({'keyring_backend': 'some.pkg.Backend'})
     applied = []
-    monkeypatch.setattr(keychain, '_import_keyring', lambda: object())
+    monkeypatch.setattr(keychain, '_import_keyring', _fake_module)
     monkeypatch.setattr(keychain, '_select_backend', lambda kr, name: applied.append(name))
     monkeypatch.setattr(keychain, '_is_fail_backend', lambda kr: False)
     keychain._configured_keyring()
@@ -433,20 +454,20 @@ def test_pass_store_ready(tmp_path, monkeypatch):
 def test_autodetect_prefers_pass_when_no_os_keychain(monkeypatch):
     monkeypatch.setattr(keychain, '_is_fail_backend', lambda kr: True)
     monkeypatch.setattr(keychain, '_pass_store_ready', lambda: True)
-    assert keychain._autodetect_backend(object()) == 'keyring_pass.PasswordStoreBackend'
+    assert keychain._autodetect_backend(_fake_module()) == 'keyring_pass.PasswordStoreBackend'
 
 
 def test_autodetect_returns_none_when_nothing_usable(monkeypatch):
     monkeypatch.setattr(keychain, '_is_fail_backend', lambda kr: True)
     monkeypatch.setattr(keychain, '_pass_store_ready', lambda: False)
-    assert keychain._autodetect_backend(object()) is None
+    assert keychain._autodetect_backend(_fake_module()) is None
 
 
 def test_autodetect_uses_active_os_keychain(monkeypatch):
     monkeypatch.setattr(keychain, '_is_fail_backend', lambda kr: False)
     backend = type('Keyring', (), {})
     backend.__module__ = 'keyring.backends.macOS'
-    fake = type('m', (), {'get_keyring': staticmethod(lambda: backend())})
+    fake = _fake_module(get_keyring=lambda: backend())
     assert keychain._autodetect_backend(fake) == 'keyring.backends.macOS.Keyring'
 
 
@@ -902,7 +923,7 @@ def test_device_login_stores_blob_and_sidecar(aws_env, monkeypatch):
     fake_keyring = _FakeKeyring()
     _login(monkeypatch, fake_keyring, oidc=_FakeOidc(pending_rounds=2))  # exercise the polling loop
 
-    blob = json.loads(fake_keyring.get_password('brolly-sso', keychain._cache_key(_SESSION)))
+    blob = _stored_blob(fake_keyring)
     assert blob['accessToken'] == 'access-tok'
     assert blob['refreshToken'] == 'refresh-tok'  # needed for silent refresh later
     assert blob['clientId'] == 'cid'
@@ -945,7 +966,7 @@ def test_device_login_warns_when_no_refresh_token_is_issued(aws_env, monkeypatch
     fake_keyring = _FakeKeyring()
     _login(monkeypatch, fake_keyring, oidc=_FakeOidc(with_refresh_token=False))
 
-    blob = json.loads(fake_keyring.get_password('brolly-sso', keychain._cache_key(_SESSION)))
+    blob = _stored_blob(fake_keyring)
     assert 'refreshToken' not in blob  # nothing fabricated
     assert json.loads(keychain._sidecar_path(keychain._cache_key(_SESSION)).read_text())['refreshable'] is False
     err = capsys.readouterr().err
@@ -968,7 +989,7 @@ def test_secure_enable_reauthorizes_a_stored_token_that_cannot_renew(aws_env, mo
     full_config = botocore.session.Session().full_config
     keychain.cmd_secure_enable(_SESSION, full_config)
 
-    blob = json.loads(fake_keyring.get_password('brolly-sso', keychain._cache_key(_SESSION)))
+    blob = _stored_blob(fake_keyring)
     assert blob['refreshToken'] == 'refresh-tok'  # re-authorized rather than left as-is
     assert 'cannot renew silently' in capsys.readouterr().err
 
@@ -989,7 +1010,7 @@ def test_secure_enable_keeps_a_stored_token_that_can_renew(aws_env, monkeypatch,
     monkeypatch.setattr(keychain, '_device_login', no_login)
     keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
 
-    blob = json.loads(fake_keyring.get_password('brolly-sso', keychain._cache_key(_SESSION)))
+    blob = _stored_blob(fake_keyring)
     assert blob['refreshToken'] == 'already-good'  # untouched
 
 
