@@ -71,9 +71,7 @@ $ brolly
 ### `brolly login [-s <session>]`
 
 Forces a fresh device-code login for a session, unconditionally — session-scoped, not profile-scoped. Rarely
-needed: `refresh` already logs in whenever a session is actually dead. Routes itself on the session's mode: under
-[secure mode](#secure-mode-os-keychain) it authorizes straight into the keychain; otherwise into the stock
-plaintext cache. Same command either way — there is no `brolly secure login`.
+needed: `refresh` already logs in whenever a session is actually dead.
 
 ### `brolly switch`
 
@@ -107,19 +105,11 @@ lets botocore refresh the access token — but only when that token is lapsed or
 isn't reset. If the SSO session is dead it falls through to a device-code login and retries. It also backfills
 a missing `sso_account_name` (one `list_accounts` call, made only when absent).
 
-If the target profile still carries the stock `sso_account_id`/`sso_role_name` under a session that's already
-[secured](#secure-mode-os-keychain), `refresh` converts it in place first and says so — see
-[healing](#secure-mode-os-keychain). The one profile it can't fix that way is one with no account/role picked yet
-(an interrupted `add`): nothing resolves credentials for it at all, so `refresh` points at
-`AWS_PROFILE=<profile> brolly switch` rather than retrying a login that can't help.
-
 ### `brolly add <profile> [-s <session>]`
 
 Creates a new profile under an existing session, walks the same picker, and leaves it authenticated. Refuses if
 the profile already exists (use `switch`) or the session is unknown, and copies `region`/`output` from a sibling
-profile when there is one. Under a [secured](#secure-mode-os-keychain) session it creates the profile already in
-secure shape — `credential_process` and `brolly_sso_*` — never a plaintext `sso_account_id`/`sso_role_name` you'd
-have to run `secure enable` again to fix.
+profile when there is one.
 
 ```console
 $ brolly add corp-qa                     # session inferred from $AWS_PROFILE
@@ -143,17 +133,16 @@ truly-dead session apart from a merely-lapsed token; `--no-check` skips that and
 The current profile is the orange one. `secure` marks which profiles keep their token in the OS keychain, and the
 whole table needs a **[Nerd Font](https://www.nerdfonts.com/)** for its glyphs, same as the prompt pill.
 
-If a secured session still has a plaintext blob sitting in `~/.aws/sso/cache` — a leftover from an older brolly,
-or from a bare `aws sso login` run against the session — `ls` flags it right under that session's line, in the
-same orange as the current-profile marker:
+A [secured](#secure-mode-os-keychain) session whose token is *also* still sitting in `~/.aws/sso/cache` — left by
+an older brolly, or by a bare `aws sso login` — gets a warning under its session line, in the same orange as the
+current-profile marker:
 
 ```console
    corp     live    expires 2026-07-25 00:37 (7h19m) · auto-renews
-            ! ~/.aws/sso/cache still holds this session's token — `brolly secure enable -s corp` removes it
+                    ! ~/.aws/sso/cache still holds this session's token — `brolly secure enable -s corp` removes it
 ```
 
-`ls` only reports this; it never deletes the file itself — every command that routes into the session does (see
-[How it works](#how-it-works)).
+`ls` reports the leak; the next command that enters the session removes it.
 
 #### Reading the expiry
 
@@ -170,10 +159,8 @@ What *is* knowable locally is whether the session holds a refresh token, so each
 ```
 
 `auto-renews` means new access tokens arrive silently until the access-portal session ends. `no refresh token`
-means this session hits a hard wall when the countdown reaches zero — fix it with `brolly login -s <session>`
-(it takes the keychain path automatically if the session is secured; there's no separate secure command). The
-note is omitted when the store can't say (a secure-mode sidecar written before brolly recorded the flag) rather
-than guessed at.
+means this session hits a hard wall when the countdown reaches zero — fix it with `brolly login -s <session>`.
+The note is omitted, rather than guessed at, when the store can't say.
 
 ### Common tasks
 
@@ -220,46 +207,33 @@ By default brolly is a thin layer over the stock plaintext `~/.aws/sso/cache` �
 `credential_process`, so every SDK and the `aws` CLI keep working with nothing but `$AWS_PROFILE` — no shell
 wrapper, no plaintext token. It's built in; [`keyring`](https://github.com/jaraco/keyring) ships as a dependency.
 
-Secure mode is a property of the **sso-session**, not of a profile or a command you call instead of another. Run
-`brolly secure enable -s <session>` once, and from then on `login`, `refresh`, `switch`, `add`, and bare `brolly`
-all detect that the session is secured and route themselves into the keychain automatically — there is no
-secure-flavoured twin of any of them. `secure` itself has exactly two subcommands: `enable` and `disable`.
+Secure mode is a property of the **sso-session**. Turn it on once and every command reads the session's mode and
+routes itself: `login` authorizes into the keychain, `add` writes new profiles already secured, `switch` and
+`refresh` keep them that way. Your workflow is unchanged — `export AWS_PROFILE=corp-prod` and every SDK resolves
+credentials through brolly.
 
-### `brolly secure enable [-s <session>]`
+### `brolly secure enable | disable [-s <session>]`
 
-Logs the session in (a device-code login brolly runs itself), rewrites every profile under it to use
-`credential_process`, and purges the now-redundant plaintext token. Idempotent — re-run it after `brolly add` to
-pull in profiles created before you enabled it, or to re-authorize a stored token that predates brolly's
-refresh-token registration; it converts only what still needs converting.
+`enable` logs the session in (a device-code login brolly runs itself), rewrites every profile under it to use
+`credential_process`, and purges the now-redundant plaintext token:
 
 ```console
 $ brolly secure enable -s corp
-→ keychain backend: pass (gpg-agent)
+→ keychain backend: pass (gpg-agent)  (saved to ~/.aws/brolly/config.json)
 ✓ authorized — SSO token stored in your OS keychain
 ✓ removed plaintext token cache for session 'corp'
 ✓ secure mode on for session 'corp' — its token now lives in the OS keychain
   3 profile(s) resolve credentials through it (3 converted just now)
 ```
 
-Re-running it against an already-secured session reports the same total with `(0 converted just now)`. A profile
-with no account/role picked yet (an interrupted `add`) is named and left alone rather than counted:
+It is idempotent, converting only what still needs it: re-run it to pull in a profile that arrived some other way
+(a hand-edited `~/.aws/config`, an `aws configure sso`), or to re-authorize a stored token that can't renew
+silently. A profile with no account/role picked yet (an interrupted `add`) has nothing to move: `enable` names it
+and leaves it alone, and `refresh` against it points at `AWS_PROFILE=<profile> brolly switch` rather than a login
+that can't help.
 
-```console
-  no account/role set yet, so left alone: corp-qa
-  finish one with `AWS_PROFILE=corp-qa brolly switch` — it will be written in secure shape
-```
-
-and a session with no profiles at all says so and points at `brolly add <profile> -s <session>`.
-
-Nothing else about your workflow changes: `export AWS_PROFILE=corp-prod` and every SDK resolves credentials
-through brolly. `login`, `refresh`, `switch`, and `add` all keep working exactly as before and stay in secure
-mode — to re-authorize a secured session whose access-portal window has fully lapsed (or that `ls` reports as
-`no refresh token`), just run `brolly login -s <session>`; there is no separate `secure login`.
-
-### `brolly secure disable [-s <session>]`
-
-Reverts every secured profile under the session to a stock plaintext-cache profile and deletes the keychain
-token: a clean, complete undo.
+`disable` reverts every secured profile to a stock plaintext-cache profile and deletes the keychain token: a
+clean, complete undo.
 
 ### How it works
 
@@ -268,51 +242,35 @@ token: a clean, complete undo.
   still happens** — no reimplementation, just a different vault. The device login registers its OIDC client for
   the `refresh_token` grant with the `sso:account:access` scope, which is what makes IAM Identity Center hand back
   a refresh token at all.
-- **brolly records which sessions are secured**, in a `secured_sessions` list inside `~/.aws/brolly/config.json`
-  (the same file that holds the chosen keychain backend). That record — not profile shape — is the authoritative
-  answer to "is this session secure": a session whose profiles are all incomplete skeletons, or which has none at
-  all yet, still reads as secured once `secure enable` has run. Without it, such a session would read as
-  plaintext and the next `brolly login` would write a fresh refresh token back to `~/.aws/sso/cache`. Scanning
-  profiles for the secure shape (`brolly_sso_*`) is kept only as a fallback, for a session secured by an older
-  brolly that never wrote the record.
-- **Stale plaintext gets purged at dispatch, not only after a login.** Every command that routes into a secured
-  session — `login`, `switch`, `refresh`, `add`, and bare `brolly` — clears a leftover blob from
-  `~/.aws/sso/cache` before doing anything else, not only the ones that end up (re-)authenticating; reporting it
-  the same way the `enable` example above does. `credential-process` does the same on every cold credential
-  resolution. That matters on upgrade: an older brolly (or a bare `aws sso login` run against a secured session)
-  could have left a live refresh token sitting in plaintext even though the session was already "secured" — the
-  next command clears it instead of leaving it on disk indefinitely. `ls` is the one command that never does this
-  — it only reports a leak (see [`brolly ls`](#brolly-ls---no-check)), since `ls` never mutates anything.
-- **A stock profile under a secured session is healed, not worked around.** A profile still carrying the stock
-  `sso_account_id`/`sso_role_name` genuinely resolves its credentials from that plaintext blob — reading,
-  refreshing and *rewriting* a live refresh token there on every `brolly refresh`. So the same dispatch that
-  clears the blob converts the profile first, immediately before the purge, and names every one it touched:
+- **A secured profile** keeps `sso_session` but moves `sso_account_id` / `sso_role_name` under `brolly_sso_*` and
+  adds `credential_process`. That combination deactivates botocore's built-in SSO credential provider so
+  resolution flows through brolly — otherwise botocore would find the now-absent plaintext token and fail.
+- **Secure-ness is recorded, not inferred** — a `secured_sessions` list inside `~/.aws/brolly/config.json` (the
+  same file that holds the chosen keychain backend). That record, not profile shape, is the authoritative answer:
+  a session whose profiles are all incomplete skeletons — or which has none yet — still reads as secured, so the
+  next `login` can't write a fresh refresh token back to `~/.aws/sso/cache`. Scanning profiles for `brolly_sso_*`
+  is a fallback, for a session secured by an older brolly that wrote no record.
+- **Entering a secured session clears stale plaintext.** `login`, `switch`, `refresh`, `add`, and bare `brolly`
+  drop a leftover `~/.aws/sso/cache` blob before doing anything else. A profile still carrying the stock
+  `sso_account_id`/`sso_role_name` is converted immediately beforehand — it would otherwise resolve credentials
+  from that blob and rotate a live refresh token back into it on every `refresh` — and each conversion is named:
 
   ```console
   ✓ converted 'corp-legacy' to secure mode — it was still resolving credentials from ~/.aws/sso/cache
   ✓ removed plaintext token cache for session 'corp'
   ```
 
-  This is a **migration path, not steady-state behaviour**: `secure enable` does the same conversion up front, so
-  a healthy session never has one of these. It matters on upgrade from a brolly whose commands didn't all dispatch
-  on the session's mode, which could strand a session half-converted. It is also the one case where brolly rewrites
-  a profile you didn't name, which is why it is reported line by line rather than silently. A profile with no
-  account/role picked yet has nothing to move, so it's left alone — it never activated botocore's SSO credential
-  provider either, so it was not reading the blob and doesn't keep it on disk.
-- **`credential-process` reports instead of healing.** It is spawned by the SDK on every cold credential
-  resolution, non-interactively and with stdout owned by the credential JSON, so it must not rewrite your
-  `~/.aws/config`. If it finds a stock profile still resolving from the blob it leaves both alone and says so:
+  `secure enable` converts up front, so a fully-enabled session has none of these; the conversion is a migration
+  path for sessions an older brolly left half-converted, and the one case where brolly rewrites a profile you
+  didn't name — hence a reported line each rather than silence.
+- **`credential-process` reports, never rewrites.** The SDK spawns it non-interactively on every cold credential
+  resolution with stdout owned by the credential JSON, so it purges a redundant blob but leaves `~/.aws/config`
+  alone. A stock profile still resolving from that blob is named and kept, for the next interactive command:
 
   ```console
   ! session 'corp' is secured, but ~/.aws/sso/cache still holds its token — corp-legacy still resolves credentials from it, so this command left it alone.
     Convert it and clear the file:  brolly secure enable -s corp
   ```
-
-  Any interactive brolly command under that session heals it on the spot.
-
-- **A secured profile** keeps `sso_session` but moves `sso_account_id` / `sso_role_name` under `brolly_sso_*` and
-  adds `credential_process`. That combination deactivates botocore's built-in SSO credential provider so
-  resolution flows through brolly — otherwise botocore would find the now-absent plaintext token and fail.
 - **The prompt pill** reads a small non-secret expiry sidecar (`~/.aws/brolly/<sha1>.json`) rather than the
   keychain, so it stays a cheap filesystem check.
 - **No environment variable to keep exported.** The chosen backend is saved to `~/.aws/brolly/config.json` and
