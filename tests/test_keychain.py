@@ -6,6 +6,7 @@ a tmp file via ``AWS_CONFIG_FILE``. No real keychain, no network, no credentials
 
 import json
 import os
+import stat
 from datetime import UTC, datetime, timedelta
 from hashlib import sha1
 
@@ -210,6 +211,141 @@ def test_config_remove_keys_respects_section_boundaries(tmp_path, monkeypatch):
     text = cfg.read_text()
     assert 'sso_account_id = 111' not in text  # removed from a
     assert 'sso_account_id = 222' in text  # b's identical key preserved
+
+
+_HEADER_FORMS = [
+    pytest.param('[profile b] # trailing comment', 'b', id='trailing-comment'),
+    pytest.param('[profile  b]', 'b', id='repeated-internal-whitespace'),
+    pytest.param('[profile b ]', 'b', id='trailing-space'),
+    pytest.param('[profile "my prof"]', 'my prof', id='quoted-name'),
+    pytest.param('[default]', 'default', id='default'),
+    pytest.param('[profilex b]', 'b', id='profile-prefixed-word'),
+]
+
+
+@pytest.mark.parametrize('header, profile', _HEADER_FORMS)
+def test_config_remove_keys_strips_the_stock_keys_from_every_header_form_botocore_reads_as_the_profile(
+    header, profile, aws_env
+):
+    """Header forms plain string equality against `[profile x]` used to miss — each of them a section botocore does
+    read as this profile. A missed section is the whole blocker: the profile keeps sso_account_id/sso_role_name, so
+    it goes on resolving out of ~/.aws/sso/cache while brolly reports it converted and deletes the blob.
+
+    The expected profile name is not asserted from taste — it is read back out of botocore first, so this pins
+    parity with the parser brolly has to agree with (including `[profilex b]`, which botocore's own
+    ``key.startswith('profile')`` + shlex resolves to `b`).
+    """
+    aws_env.write_text(f'{header}\nsso_session = corp\nsso_account_id = 111111111111\nsso_role_name = ReadOnly\n')
+    assert list(botocore.session.Session().full_config['profiles']) == [profile]  # botocore's reading, not ours
+
+    keychain._config_remove_keys(profile, {'sso_account_id', 'sso_role_name'})
+
+    assert botocore.session.Session(profile=profile).get_scoped_config() == {'sso_session': 'corp'}
+
+
+_NEAR_MISS_HEADERS = [
+    pytest.param('[profileb]', 'b', id='no-separator'),
+    pytest.param('[sso-session b]', 'b', id='sso-session'),
+    pytest.param('[profile b c]', 'b', id='three-words'),
+    pytest.param('[ default ]', 'default', id='padded-default'),
+]
+
+
+@pytest.mark.parametrize('header, profile', _NEAR_MISS_HEADERS)
+def test_config_remove_keys_leaves_a_section_botocore_does_not_read_as_the_profile_alone(header, profile, aws_env):
+    """The other half of parity, and the reason the matcher cannot simply be loose: a header botocore does *not*
+    resolve to this profile is somebody else's section, and deleting keys out of it edits config brolly was never
+    asked to touch."""
+    body = 'sso_session = corp\nsso_account_id = 111111111111\nsso_role_name = ReadOnly\n'
+    aws_env.write_text(f'{header}\n{body}')
+    assert profile not in botocore.session.Session().full_config['profiles']
+
+    keychain._config_remove_keys(profile, {'sso_account_id', 'sso_role_name'})
+
+    assert aws_env.read_text() == f'{header}\n{body}'
+
+
+def test_config_remove_keys_matches_option_names_case_insensitively(aws_env):
+    """configparser lowercases option names, so `SSO_Account_ID` is the same key to botocore — and still activates
+    the SSO credential provider. Matching the file's casing left the trigger in place."""
+    aws_env.write_text(
+        f'[profile {_PROFILE}]\nsso_session = corp\nSSO_Account_ID = 111111111111\nSso_Role_Name = ReadOnly\n'
+    )
+
+    keychain._config_remove_keys(_PROFILE, {'sso_account_id', 'sso_role_name'})
+
+    assert botocore.session.Session(profile=_PROFILE).get_scoped_config() == {'sso_session': 'corp'}
+
+
+def test_config_remove_keys_removes_a_colon_delimited_option(aws_env):
+    """configparser accepts `key: value` as readily as `key = value`, so a hand-written `sso_account_id: 123` is a
+    live SSO trigger — splitting on `=` alone walked straight past it."""
+    aws_env.write_text(
+        f'[profile {_PROFILE}]\n'
+        'sso_session = corp\n'
+        'sso_account_id: 111111111111\n'
+        'sso_role_name:ReadOnly\n'
+        'sso_start_url = https://corp.awsapps.com/start\n'
+    )
+
+    keychain._config_remove_keys(_PROFILE, {'sso_account_id', 'sso_role_name'})
+
+    cfg = botocore.session.Session(profile=_PROFILE).get_scoped_config()
+    assert 'sso_account_id' not in cfg
+    assert 'sso_role_name' not in cfg
+    # a `=` line whose *value* holds a colon is still read on its first delimiter, so it is not taken for a key
+    assert cfg['sso_start_url'] == 'https://corp.awsapps.com/start'
+
+
+def test_config_remove_keys_leaves_every_other_byte_of_the_file_untouched(aws_env):
+    """Why this is a line edit and not a configparser round-trip: deleting two keys must not cost the user their
+    comments, blank lines, key ordering, indentation or casing anywhere else in ~/.aws/config."""
+    aws_env.write_text(
+        '# my aws config\n'
+        '\n'
+        '[sso-session corp]\n'
+        'sso_start_url = https://corp.awsapps.com/start\n'
+        'sso_region = us-east-1\n'
+        '\n'
+        f'[profile {_PROFILE}]   ; the one being converted\n'
+        '  region = us-east-1\n'
+        'sso_account_id = 111111111111\n'
+        '# keep this comment\n'
+        'sso_role_name = ReadOnly\n'
+        'Output   =   JSON\n'
+        '\n'
+        '[profile other]\n'
+        'sso_account_id = 999999999999\n'
+    )
+
+    keychain._config_remove_keys(_PROFILE, {'sso_account_id', 'sso_role_name'})
+
+    assert aws_env.read_text() == (
+        '# my aws config\n'
+        '\n'
+        '[sso-session corp]\n'
+        'sso_start_url = https://corp.awsapps.com/start\n'
+        'sso_region = us-east-1\n'
+        '\n'
+        f'[profile {_PROFILE}]   ; the one being converted\n'
+        '  region = us-east-1\n'
+        '# keep this comment\n'
+        'Output   =   JSON\n'
+        '\n'
+        '[profile other]\n'
+        'sso_account_id = 999999999999\n'
+    )
+
+
+def test_config_remove_keys_keeps_the_config_files_permissions(aws_env):
+    """The rewrite goes through a temp file `mkstemp` creates at 0600, so without carrying the mode over brolly
+    would silently re-permission a config the user (or their tooling) set deliberately."""
+    _write_config(aws_env, secure=False)
+    aws_env.chmod(0o640)
+
+    keychain._config_remove_keys(_PROFILE, {'sso_account_id', 'sso_role_name'})
+
+    assert stat.S_IMODE(aws_env.stat().st_mode) == 0o640
 
 
 def test_cache_key_matches_botocore_convention():
@@ -419,6 +555,52 @@ def test_heal_session_profiles_leaves_a_skeleton_alone(aws_env, capsys):
     }
     assert _SKELETON not in capsys.readouterr().err
     assert keychain._stock_profiles(_SESSION, full_config) == []  # a skeleton never held the blob back
+
+
+def test_secure_profile_refuses_to_call_a_profile_converted_while_its_stock_keys_survive(aws_env, monkeypatch, capsys):
+    """The blocker itself: the removal is a line edit against a file botocore parses more liberally than any matcher
+    of ours, so its result is read back rather than assumed. A profile whose stock keys survived still resolves out
+    of ~/.aws/sso/cache, and calling it converted is what licenses deleting the very blob it reads."""
+    _write_config(aws_env, secure=False)
+    monkeypatch.setattr(keychain, '_config_remove_keys', lambda *a, **k: None)  # a removal that does not land
+    cfg = botocore.session.Session().full_config['profiles'][_PROFILE]
+
+    assert keychain._secure_profile(_PROFILE, _ACCOUNT, _ROLE, 'corp-prod', cfg) is False
+
+    err = capsys.readouterr().err
+    assert _PROFILE in err
+    assert str(aws_env) in err  # names the file the user has to edit by hand
+    on_disk = botocore.session.Session(profile=_PROFILE).get_scoped_config()
+    assert on_disk['sso_account_id'] == _ACCOUNT  # the disk truth, unchanged
+    assert cfg == on_disk  # and the caller's in-memory copy was replaced by it, not by the hoped-for shape
+
+
+def test_secure_profile_reports_the_second_section_an_unusual_header_makes_aws_configure_set_write(aws_env, capsys):
+    """The read-back's other job, with nothing mocked: `aws configure set` matches section headers far more strictly
+    than botocore reads them, so under `[profile  corp-prod]` (two spaces) it appends a *fresh* `[profile
+    corp-prod]` — and botocore then resolves the profile entirely out of that last section, losing sso_session with
+    it. Assuming the rewrite landed would report a profile as secured that can no longer resolve anything at all."""
+    aws_env.write_text(
+        '\n'.join([
+            '[sso-session corp]',
+            'sso_start_url = https://corp.awsapps.com/start',
+            'sso_region = us-east-1',
+            '',
+            f'[profile  {_PROFILE}]',  # two spaces: still this profile to botocore, not to `aws configure set`
+            'sso_session = corp',
+            'region = us-east-1',
+            f'sso_account_id = {_ACCOUNT}',
+            f'sso_role_name = {_ROLE}',
+        ])
+        + '\n'
+    )
+
+    assert keychain._secure_profile(_PROFILE, _ACCOUNT, _ROLE, None) is False
+
+    err = capsys.readouterr().err
+    assert _PROFILE in err
+    assert 'missing sso_session' in err
+    assert 'second [profile corp-prod] section' in err  # names what happened, not just that something did
 
 
 def test_secure_enable_and_healing_share_one_pass_over_the_profiles(aws_env, monkeypatch, capsys):

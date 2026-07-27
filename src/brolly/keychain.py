@@ -15,6 +15,8 @@ refresh, but which alone does not activate the credential SSO provider.
 
 import json
 import os
+import re
+import shlex
 import shutil
 import sys
 from contextlib import contextmanager, suppress
@@ -40,7 +42,9 @@ from .cli import (
     Region,
     RoleName,
     SessionName,
+    _atomic_write,
     _aws,
+    _aws_config_path,
     _aws_dir,
     _config_path,
     _create_profile_skeleton,
@@ -309,26 +313,73 @@ class _KeychainTokenCache:
         _remove_sidecar(cache_key)
 
 
+_SECTION_HEADER = re.compile(r'\[(?P<header>.+)\]')
+
+
+def _header_profile(line: str) -> ProfileName | None:
+    """The profile a section header names, or None — resolved exactly as botocore resolves it.
+
+    Anything narrower silently misses sections botocore honours, and a missed section means the stock SSO keys
+    survive a conversion. configparser's header pattern is greedy and unanchored (so a trailing comment is not part
+    of the name), it never strips the captured header (so ``[ default ]`` is *not* the default profile), and
+    botocore then ``shlex.split``s it — which collapses repeated whitespace and unquotes quoted names.
+    """
+    match = _SECTION_HEADER.match(line.strip())
+    if match is None:
+        return None
+    header = match.group('header')
+    if header == 'default':
+        return 'default'
+    if not header.startswith('profile'):
+        return None
+    try:
+        parts = shlex.split(header)
+    except ValueError:
+        return None
+    return parts[1] if len(parts) == 2 else None
+
+
+_OPTION_DELIMITERS = ('=', ':')
+
+
+def _option_name(line: str) -> str | None:
+    """The option a line names, or None if it names none — configparser accepts ``:`` as well as ``=``.
+
+    Splitting on ``=`` alone leaves a hand-written ``sso_account_id: 123`` in place, which botocore reads exactly
+    like the ``=`` form: the SSO credential provider goes on activating on a profile brolly has just called
+    secured. Whichever delimiter comes first is the one configparser uses, so this reads the same key it does.
+    """
+    positions = [line.index(delimiter) for delimiter in _OPTION_DELIMITERS if delimiter in line]
+    return line[: min(positions)].strip().lower() if positions else None
+
+
 def _config_remove_keys(profile: ProfileName, keys: set[str]) -> None:
     """Delete specific ``key = value`` lines from a profile section, preserving the rest of the file verbatim.
 
     ``aws configure set`` can only add or blank keys, and a blanked ``sso_account_id =`` still counts as present
-    to botocore — so removing the SSO credential-provider trigger has to be done at the line level.
+    to botocore — so removing the SSO credential-provider trigger has to be done at the line level. Line level and
+    not a configparser round-trip: that would rewrite the user's whole config, dropping their comments, blank lines
+    and key ordering as a side effect of deleting two lines.
     """
-    path = Path(os.environ.get('AWS_CONFIG_FILE') or Path.home() / '.aws' / 'config')
+    path = _aws_config_path()
     if not path.is_file():
         return
-    header = '[default]' if profile == 'default' else f'[profile {profile}]'
+    wanted = {key.lower() for key in keys}  # configparser lowercases option names, so the file's casing is free
     out: list[str] = []
     in_section = False
     for line in path.read_text().splitlines(keepends=True):
         stripped = line.strip()
         if stripped.startswith('['):
-            in_section = stripped == header
-        elif in_section and '=' in line and line.split('=', 1)[0].strip() in keys:
+            in_section = _header_profile(stripped) == profile
+        elif in_section and _option_name(line) in wanted:
             continue
         out.append(line)
-    path.write_text(''.join(out))
+    _atomic_write(path, ''.join(out))
+
+
+def _profile_on_disk(profile: ProfileName) -> AwsConfig:
+    """Re-read one profile straight from ~/.aws/config — the only way to know a line-level removal actually landed."""
+    return botocore.session.Session().full_config['profiles'].get(profile, {})
 
 
 def _secure_profile(
@@ -337,11 +388,16 @@ def _secure_profile(
     role: RoleName,
     account_name: str | None,
     cfg: AwsConfig | None = None,
-) -> None:
+) -> bool:
     """Rewrite one profile into secure shape: add ``credential_process`` + ``brolly_sso_*``, drop the SSO trigger.
 
-    ``cfg`` is this profile's entry in a caller's already-loaded ``full_config``; passing it keeps that in-memory
-    copy in step with the file just rewritten, so nothing downstream in the same command still reads it as stock.
+    Returns whether the profile really is secure now. The removal is a line edit against a file botocore parses
+    more liberally than any matcher of ours, so the result is read back rather than assumed: a profile that kept
+    its stock keys still resolves out of ~/.aws/sso/cache, and reporting it as converted would license deleting the
+    very blob it reads.
+
+    ``cfg`` is this profile's entry in a caller's already-loaded ``full_config``; passing it replaces that
+    in-memory copy with what is now on disk, so nothing downstream in the same command works off a false premise.
     """
     command = f'brolly credential-process --profile {profile}'
     _aws('configure', 'set', 'credential_process', command, '--profile', profile)
@@ -350,13 +406,32 @@ def _secure_profile(
     if account_name:
         _aws('configure', 'set', 'sso_account_name', account_name, '--profile', profile)
     _config_remove_keys(profile, {'sso_account_id', 'sso_role_name'})
-    if cfg is None:
-        return
-    cfg.update({'credential_process': command, 'brolly_sso_account_id': account_id, 'brolly_sso_role_name': role})
-    if account_name:
-        cfg['sso_account_name'] = account_name
-    cfg.pop('sso_account_id', None)
-    cfg.pop('sso_role_name', None)
+
+    on_disk = _profile_on_disk(profile)
+    if cfg is not None:
+        cfg.clear()
+        cfg.update(on_disk)
+    if on_disk.get('sso_account_id') or on_disk.get('sso_role_name'):
+        print(
+            f"! '{profile}' still carries sso_account_id/sso_role_name in {_aws_config_path()} after brolly tried "
+            f'to remove them, so it goes on resolving credentials from ~/.aws/sso/cache and brolly will not treat '
+            f'it as secured.\n'
+            f'  Delete those two lines from its section by hand, then re-run the command.',
+            file=sys.stderr,
+        )
+        return False
+    missing = [key for key in ('sso_session', 'credential_process', 'brolly_sso_role_name') if key not in on_disk]
+    if missing:
+        print(
+            f"! '{profile}' is not in secure shape after the rewrite — read back from {_aws_config_path()} it is "
+            f'missing {", ".join(missing)}.\n'
+            f'  `aws configure set` matches section headers more strictly than botocore reads them, so an unusual '
+            f'header (a trailing comment, a quoted or oddly spaced name) makes it write a second [profile '
+            f'{profile}] section that shadows the first. Merge the two by hand, then re-run the command.',
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 class _Reshaped(NamedTuple):
