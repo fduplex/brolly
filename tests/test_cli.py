@@ -8,12 +8,16 @@ down `_session_is_secure` itself, including the self-healing mixed-session case.
 
 import subprocess
 
+import botocore.session
 import pytest
 
 from brolly import cli, keychain
 
 _SESSION = 'corp'
 _PROFILE = 'corp-prod'
+_STOCK = 'corp-legacy'
+_SKELETON = 'corp-qa'
+_STOCK_ACCOUNT = '999999999999'
 
 
 @pytest.fixture(autouse=True)
@@ -361,7 +365,147 @@ def test_add_purges_a_planted_plaintext_blob_on_a_secured_session(dispatch_env, 
     assert not plaintext.exists()
 
 
+# --- auto-heal at dispatch -----------------------------------------------------------------------
+
+
+def _write_mixed_session_config(path, *, stock: tuple[str, ...] = (_STOCK,), skeletons: tuple[str, ...] = ()) -> None:
+    """A secured session with one converted profile plus the shapes an upgrade can strand under it: profiles still
+    carrying the stock SSO keys, and skeletons with no account/role picked yet."""
+    lines = [
+        f'[sso-session {_SESSION}]',
+        'sso_start_url = https://corp.awsapps.com/start',
+        'sso_region = us-east-1',
+        '',
+        f'[profile {_PROFILE}]',
+        f'sso_session = {_SESSION}',
+        'region = us-east-1',
+        'brolly_sso_account_id = 111111111111',
+        'brolly_sso_role_name = AdministratorAccess',
+        f'credential_process = brolly credential-process --profile {_PROFILE}',
+    ]
+    for profile in stock:
+        lines += [
+            '',
+            f'[profile {profile}]',
+            f'sso_session = {_SESSION}',
+            'region = us-east-1',
+            f'sso_account_id = {_STOCK_ACCOUNT}',
+            'sso_role_name = ReadOnly',
+            f'sso_account_name = {profile}-acct',
+        ]
+    for profile in skeletons:
+        lines += ['', f'[profile {profile}]', f'sso_session = {_SESSION}', 'region = us-east-1']
+    path.write_text('\n'.join(lines) + '\n')
+
+
+@pytest.fixture
+def stubbed_commands(monkeypatch):
+    """Stub out every command body a dispatching run could reach — these tests are about what
+    `_enter_secure_session` does before any of them runs, not about the commands themselves."""
+    monkeypatch.setattr(cli, 'cmd_refresh', lambda *a, **k: None)
+    for name in ('cmd_secure_login', 'cmd_secure_switch', 'cmd_secure_add'):
+        monkeypatch.setattr(keychain, name, lambda *a, **k: None)
+
+
+_DISPATCHING_COMMANDS = [
+    pytest.param([], id='bare-brolly'),
+    pytest.param(['refresh'], id='refresh'),
+    pytest.param(['login', '-s', _SESSION], id='login'),
+    pytest.param(['switch'], id='switch'),
+    pytest.param(['add', 'corp-new', '-s', _SESSION], id='add'),
+]
+
+
+@pytest.mark.parametrize('argv', _DISPATCHING_COMMANDS)
+def test_every_dispatching_command_heals_a_stock_sibling_and_then_purges(
+    argv, dispatch_env, monkeypatch, stubbed_commands, capsys
+):
+    """The mixed session, closed: a stock sibling rotates a live refresh token through ~/.aws/sso/cache on every
+    refresh, so every command that routes into a secured session converts it — and only then may purge the blob."""
+    _write_mixed_session_config(dispatch_env)
+    monkeypatch.setenv('AWS_PROFILE', _PROFILE)
+    plaintext = _plant_plaintext(_SESSION)
+
+    cli.main(argv)
+
+    cfg = botocore.session.Session(profile=_STOCK).get_scoped_config()
+    assert cfg['brolly_sso_account_id'] == _STOCK_ACCOUNT
+    assert cfg['brolly_sso_role_name'] == 'ReadOnly'
+    assert cfg['credential_process'] == f'brolly credential-process --profile {_STOCK}'
+    assert 'sso_account_id' not in cfg  # the SSO credential-provider trigger is gone
+    assert 'sso_role_name' not in cfg
+    assert _STOCK in capsys.readouterr().err  # never silent: the profile brolly rewrote unasked is named
+    assert not plaintext.exists()  # healing removed the last reader, so the purge no longer holds back
+
+
+def test_healing_names_every_profile_it_rewrites(dispatch_env, monkeypatch, stubbed_commands, capsys):
+    _write_mixed_session_config(dispatch_env, stock=[_STOCK, 'corp-old'])
+    monkeypatch.setenv('AWS_PROFILE', _PROFILE)
+
+    cli.main([])
+
+    healed = [line for line in capsys.readouterr().err.splitlines() if 'converted' in line]
+    assert len(healed) == 2  # one line each, not a summary count
+    assert any(_STOCK in line for line in healed)
+    assert any('corp-old' in line for line in healed)
+
+
+def test_a_skeleton_is_left_alone_and_never_blocks_the_purge(dispatch_env, monkeypatch, stubbed_commands, capsys):
+    """A skeleton has no account/role to move, so healing cannot touch it — and it never activated botocore's SSO
+    credential provider either, so it was not reading the blob and must not keep it on disk."""
+    _write_mixed_session_config(dispatch_env, stock=[], skeletons=[_SKELETON])
+    monkeypatch.setenv('AWS_PROFILE', _PROFILE)
+    plaintext = _plant_plaintext(_SESSION)
+
+    cli.main([])
+
+    cfg = botocore.session.Session(profile=_SKELETON).get_scoped_config()
+    assert cfg == {'sso_session': _SESSION, 'region': 'us-east-1'}  # untouched
+    assert _SKELETON not in capsys.readouterr().err
+    assert not plaintext.exists()
+
+
+def test_a_healed_profile_deactivates_the_sso_credential_provider(dispatch_env, monkeypatch, stubbed_commands):
+    """The load-bearing invariant, re-asserted on the profile healing rewrote: botocore's SSO credential provider
+    must skip it so resolution falls through to `credential_process`."""
+    from botocore.credentials import ProfileProviderBuilder
+
+    _write_mixed_session_config(dispatch_env)
+    monkeypatch.setenv('AWS_PROFILE', _PROFILE)
+
+    cli.main([])
+
+    builder = ProfileProviderBuilder(botocore.session.Session(profile=_STOCK))
+    assert builder._create_sso_provider(_STOCK).load() is None
+
+
+def test_a_skeleton_never_activates_the_sso_credential_provider(dispatch_env):
+    """Why leaving skeletons alone is safe rather than merely unavoidable — with neither account nor role the SSO
+    provider skips, so a skeleton never resolved from ~/.aws/sso/cache in the first place."""
+    from botocore.credentials import ProfileProviderBuilder
+
+    _write_mixed_session_config(dispatch_env, stock=[], skeletons=[_SKELETON])
+
+    builder = ProfileProviderBuilder(botocore.session.Session(profile=_SKELETON))
+    assert builder._create_sso_provider(_SKELETON).load() is None
+
+
 # --- cmd_refresh on a stock profile under a secured session --------------------------------------
+
+
+def test_refresh_points_a_skeleton_under_a_secured_session_at_switch(monkeypatch):
+    """Healing converts every stock profile before `refresh` runs, so the skeleton is the case that survives — and
+    `secure enable` cannot finish it either, so the message has to name the command that can."""
+    monkeypatch.setattr(cli.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a, 1, stdout='', stderr=''))
+    full_config = _full_config({_SESSION: 'us-east-1'}, {_SKELETON: {'sso_session': _SESSION}})
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.cmd_refresh(_SKELETON, _SESSION, full_config, secure=True)
+
+    message = str(exc_info.value)
+    assert _SKELETON in message
+    assert 'brolly switch' in message
+    assert 'secure enable' not in message  # it would report this profile as left alone, not fix it
 
 
 def test_refresh_reports_a_stock_profile_under_a_secured_session_by_name(monkeypatch):

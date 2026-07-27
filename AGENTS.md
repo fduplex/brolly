@@ -28,6 +28,13 @@ shells out to `aws sso login` (or otherwise writes the plaintext cache) without 
 will silently overwrite a secured session's refresh token in `~/.aws/sso/cache`, which is the bug this dispatch
 rule exists to prevent.
 
+`cli._enter_secure_session` is the one door into the keychain paths, and its three steps are ordered: back-fill
+the secured-session record, `keychain.heal_session_profiles` (which shares `_reshape_session_profiles` with
+`secure enable`, so the two can't disagree), then `purge_session_plaintext`. Healing removes the last profile
+reading the plaintext blob, which is what lets the purge run unconditionally — reorder them and the purge starts
+refusing again. `credential-process` shares the purge but never heals: it is non-interactive and must not rewrite
+`~/.aws/config`, and it is the only path where `purge_session_plaintext`'s stock-profile guard still fires.
+
 ## Regenerating the README illustrations
 
 Every `.svg` under `assets/` is generated, never hand-edited:

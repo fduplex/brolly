@@ -147,6 +147,37 @@ def _write_config(path, *, secure: bool) -> None:
     path.write_text('\n'.join(lines) + '\n')
 
 
+_STOCK = 'corp-legacy'
+_SKELETON = 'corp-qa'
+
+
+def _write_mixed_config(path, *, skeleton: bool = False) -> None:
+    """A secured session with `corp-prod` already converted and `corp-legacy` still in stock shape — optionally
+    plus a skeleton, the shape healing cannot finish."""
+    lines = [
+        '[sso-session corp]',
+        'sso_start_url = https://corp.awsapps.com/start',
+        'sso_region = us-east-1',
+        '',
+        '[profile corp-prod]',
+        'sso_session = corp',
+        'region = us-east-1',
+        'brolly_sso_account_id = 222222222222',
+        'brolly_sso_role_name = AdministratorAccess',
+        'credential_process = brolly credential-process --profile corp-prod',
+        '',
+        f'[profile {_STOCK}]',
+        'sso_session = corp',
+        'region = us-east-1',
+        'sso_account_id = 333333333333',
+        'sso_role_name = ReadOnly',
+        'sso_account_name = corp-legacy-acct',
+    ]
+    if skeleton:
+        lines += ['', f'[profile {_SKELETON}]', 'sso_session = corp', 'region = us-east-1']
+    path.write_text('\n'.join(lines) + '\n')
+
+
 @pytest.fixture
 def aws_env(tmp_path, monkeypatch):
     cfg = tmp_path / 'config'
@@ -352,6 +383,62 @@ def test_secured_profile_deactivates_sso_credential_provider(aws_env):
     _write_config(aws_env, secure=True)
     builder = ProfileProviderBuilder(botocore.session.Session(profile=_PROFILE))
     assert builder._create_sso_provider(_PROFILE).load() is None
+
+
+def test_heal_session_profiles_converts_a_stock_profile_and_names_it(aws_env, capsys):
+    _write_mixed_config(aws_env)
+    full_config = botocore.session.Session().full_config
+
+    assert keychain.heal_session_profiles(_SESSION, full_config) == [_STOCK]
+
+    cfg = botocore.session.Session(profile=_STOCK).get_scoped_config()
+    assert cfg['brolly_sso_account_id'] == '333333333333'
+    assert cfg['brolly_sso_role_name'] == 'ReadOnly'
+    assert cfg['sso_account_name'] == 'corp-legacy-acct'  # preserved, so the prompt keeps its friendly name
+    assert 'sso_account_id' not in cfg
+    assert _STOCK in capsys.readouterr().err
+    # the caller's in-memory config moved with the file — this is what lets the purge that follows run at all
+    assert keychain._stock_profiles(_SESSION, full_config) == []
+
+
+def test_heal_session_profiles_is_a_silent_noop_on_a_healthy_session(aws_env, capsys):
+    _write_config(aws_env, secure=True)
+    assert keychain.heal_session_profiles(_SESSION, botocore.session.Session().full_config) == []
+    assert capsys.readouterr().err == ''
+
+
+def test_heal_session_profiles_leaves_a_skeleton_alone(aws_env, capsys):
+    _write_mixed_config(aws_env, skeleton=True)
+    full_config = botocore.session.Session().full_config
+
+    assert keychain.heal_session_profiles(_SESSION, full_config) == [_STOCK]
+
+    assert botocore.session.Session(profile=_SKELETON).get_scoped_config() == {
+        'sso_session': _SESSION,
+        'region': 'us-east-1',
+    }
+    assert _SKELETON not in capsys.readouterr().err
+    assert keychain._stock_profiles(_SESSION, full_config) == []  # a skeleton never held the blob back
+
+
+def test_secure_enable_and_healing_share_one_pass_over_the_profiles(aws_env, monkeypatch, capsys):
+    """`secure enable` converts up front what healing converts on upgrade — one helper, so they cannot disagree."""
+    _write_mixed_config(aws_env, skeleton=True)
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password(
+        'brolly-sso', keychain._cache_key(_SESSION), json.dumps({**_live_blob(), 'refreshToken': 'good'})
+    )
+    monkeypatch.setattr(keychain, '_import_keyring', lambda: fake_keyring)
+    monkeypatch.setattr(keychain, '_autodetect_backend', lambda _: 'fake.Backend')
+    monkeypatch.setattr(keychain, '_select_backend', lambda *a: None)
+    monkeypatch.setattr(keychain, '_backend_label', lambda _: 'fake')
+
+    keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    out = capsys.readouterr().out
+    assert '2 profile(s) resolve credentials through it (1 converted just now)' in out
+    assert f'no account/role set yet, so left alone: {_SKELETON}' in out
+    assert 'brolly_sso_account_id' in botocore.session.Session(profile=_STOCK).get_scoped_config()
 
 
 def test_credential_process_emits_version_1_json(aws_env, monkeypatch, capsys):
@@ -565,9 +652,12 @@ def test_purge_session_plaintext_removes_the_blob_when_nothing_still_needs_it(tm
     assert f"removed plaintext token cache for session '{_SESSION}'" in capsys.readouterr().err
 
 
-def test_purge_session_plaintext_leaves_the_file_when_a_stock_sibling_profile_exists(tmp_path, monkeypatch, capsys):
-    """The mixed-session guard: a stock sibling still resolves its credentials out of this exact blob, so deleting
-    it would break a working profile with nothing but a browser login to get it back."""
+def test_purge_session_plaintext_guards_the_file_while_a_stock_sibling_still_resolves_from_it(
+    tmp_path, monkeypatch, capsys
+):
+    """The guard, and all it now covers: a stock sibling resolves its credentials out of this exact blob, so
+    deleting it would break a working profile. Every user-facing command heals such a profile before purging
+    (`cli._enter_secure_session`), so this stands for `credential-process` alone — see the test below."""
     monkeypatch.setenv('HOME', str(tmp_path))
     plaintext = keychain._plaintext_token_path(_SESSION)
     plaintext.parent.mkdir(parents=True)
@@ -582,6 +672,27 @@ def test_purge_session_plaintext_leaves_the_file_when_a_stock_sibling_profile_ex
     err = capsys.readouterr().err
     assert _PROFILE in err
     assert f"session '{_SESSION}' is secured" in err
+
+
+def test_credential_process_leaves_the_blob_and_the_stock_sibling_alone(aws_env, monkeypatch, capsys):
+    """The one path the guard still fires on. `credential-process` is spawned by the SDK on every cold credential
+    resolution, non-interactively and with stdout owned by the credential JSON — it must not rewrite ~/.aws/config
+    to heal a sibling, so it reports and leaves both the profile and the blob as they are."""
+    _write_mixed_config(aws_env)
+    plaintext = keychain._plaintext_token_path(_SESSION)
+    plaintext.parent.mkdir(parents=True)
+    plaintext.write_text('{"accessToken": "stale", "refreshToken": "leaked"}')
+
+    fake_keyring = _FakeKeyring()
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(_live_blob()))
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake_keyring)
+    monkeypatch.setattr(keychain.boto3, 'client', lambda *a, **k: _FakeSso(0))
+
+    keychain.cmd_credential_process(_PROFILE)
+
+    assert plaintext.is_file()
+    assert 'sso_account_id' in botocore.session.Session(profile=_STOCK).get_scoped_config()  # never healed here
+    assert _STOCK in capsys.readouterr().err
 
 
 def test_purge_session_plaintext_is_a_cheap_noop_when_no_plaintext_file_exists(tmp_path, monkeypatch, capsys):

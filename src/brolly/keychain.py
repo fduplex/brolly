@@ -23,7 +23,7 @@ from hashlib import sha1
 from pathlib import Path
 from time import sleep
 from types import ModuleType
-from typing import Any
+from typing import Any, NamedTuple
 
 import boto3
 import botocore.session
@@ -220,7 +220,8 @@ def _purge_plaintext_token(session_name: SessionName) -> None:
 
 def _stock_profiles(session_name: SessionName, full_config: AwsConfig) -> list[ProfileName]:
     """Profiles under the session still carrying both stock SSO keys — botocore resolves those from the plaintext
-    blob, and they are exactly the set ``cmd_secure_enable`` converts, so what it fixes is what this reports."""
+    blob, and they are exactly the set ``_reshape_session_profiles`` converts, so what healing fixes is what this
+    reports."""
     return sorted(
         p for p, c in _session_profiles(session_name, full_config) if c.get('sso_account_id') and c.get('sso_role_name')
     )
@@ -230,10 +231,11 @@ def purge_session_plaintext(session_name: SessionName, full_config: AwsConfig | 
     """Clear a secured session's plaintext token whether or not this command authenticated — ``cli`` runs this from
     the one place that decides a session is secure, so no command can forget it.
 
-    One exception, stated rather than silent: while a stock profile is still configured under the session, botocore
+    One guard, stated rather than silent: while a stock profile is still configured under the session, botocore
     resolves *its* credentials out of this very blob, and deleting it would break a working profile with nothing
-    but a browser login to get it back. That case is reported and left alone; `secure enable` is the command that
-    converts those profiles and clears the file in one go.
+    but a browser login to get it back. ``cli._enter_secure_session`` heals those profiles before it purges, so no
+    user-facing command reaches this. It stands for ``cmd_credential_process``, which shares the purge but runs
+    non-interactively on every cold credential resolution and must not rewrite ``~/.aws/config`` behind the SDK.
     """
     if not _plaintext_token_path(session_name).is_file():
         return  # the common case, and the only cost on it: one stat
@@ -329,8 +331,18 @@ def _config_remove_keys(profile: ProfileName, keys: set[str]) -> None:
     path.write_text(''.join(out))
 
 
-def _secure_profile(profile: ProfileName, account_id: AccountId, role: RoleName, account_name: str | None) -> None:
-    """Rewrite one profile into secure shape: add ``credential_process`` + ``brolly_sso_*``, drop the SSO trigger."""
+def _secure_profile(
+    profile: ProfileName,
+    account_id: AccountId,
+    role: RoleName,
+    account_name: str | None,
+    cfg: AwsConfig | None = None,
+) -> None:
+    """Rewrite one profile into secure shape: add ``credential_process`` + ``brolly_sso_*``, drop the SSO trigger.
+
+    ``cfg`` is this profile's entry in a caller's already-loaded ``full_config``; passing it keeps that in-memory
+    copy in step with the file just rewritten, so nothing downstream in the same command still reads it as stock.
+    """
     command = f'brolly credential-process --profile {profile}'
     _aws('configure', 'set', 'credential_process', command, '--profile', profile)
     _aws('configure', 'set', 'brolly_sso_account_id', account_id, '--profile', profile)
@@ -338,6 +350,60 @@ def _secure_profile(profile: ProfileName, account_id: AccountId, role: RoleName,
     if account_name:
         _aws('configure', 'set', 'sso_account_name', account_name, '--profile', profile)
     _config_remove_keys(profile, {'sso_account_id', 'sso_role_name'})
+    if cfg is None:
+        return
+    cfg.update({'credential_process': command, 'brolly_sso_account_id': account_id, 'brolly_sso_role_name': role})
+    if account_name:
+        cfg['sso_account_name'] = account_name
+    cfg.pop('sso_account_id', None)
+    cfg.pop('sso_role_name', None)
+
+
+class _Reshaped(NamedTuple):
+    """One pass over a session's profiles: those rewritten into secure shape just now, those already in it, and
+    those carrying no account/role to move."""
+
+    converted: list[ProfileName]
+    already: list[ProfileName]
+    skeletons: list[ProfileName]
+
+
+def _reshape_session_profiles(session_name: SessionName, full_config: AwsConfig) -> _Reshaped:
+    """Rewrite every stock profile under the session into secure shape — the pass `secure enable` and healing share.
+
+    Mutates ``full_config`` alongside the file: both callers hand the same dict to whatever runs next.
+    """
+    converted: list[ProfileName] = []
+    already: list[ProfileName] = []
+    skeletons: list[ProfileName] = []
+    for profile, cfg in _session_profiles(session_name, full_config):
+        if _is_secure(cfg):
+            already.append(profile)
+            continue
+        account_id, role = cfg.get('sso_account_id'), cfg.get('sso_role_name')
+        if not (account_id and role):
+            skeletons.append(profile)  # an incomplete profile — nothing to move into brolly_sso_*
+            continue
+        _secure_profile(profile, account_id, role, cfg.get('sso_account_name'), cfg)
+        converted.append(profile)
+    return _Reshaped(converted, already, skeletons)
+
+
+def heal_session_profiles(session_name: SessionName, full_config: AwsConfig) -> list[ProfileName]:
+    """Convert any stock profile under an already-secured session, naming each one — never silent.
+
+    A migration path, not steady-state: `secure enable` converts every profile up front, so a healthy session has
+    none of these. They exist on upgrade from a brolly whose commands did not all dispatch on the session's mode,
+    and while one survives it resolves credentials out of the plaintext blob and rotates a live refresh token back
+    into it on every refresh. Healing is therefore what lets the purge that follows run unconditionally.
+    """
+    healed = _reshape_session_profiles(session_name, full_config).converted
+    for profile in healed:
+        print(
+            f"✓ converted '{profile}' to secure mode — it was still resolving credentials from ~/.aws/sso/cache",
+            file=sys.stderr,
+        )
+    return healed
 
 
 def _registration_scopes(sso_config: AwsConfig) -> list[str]:
@@ -533,30 +599,21 @@ def cmd_secure_enable(session_name: SessionName, full_config: AwsConfig, backend
     _record_secured_session(session_name, True)
 
     # The token is safely in the keychain now — drop the redundant plaintext copy botocore/aws-cli left behind.
-    # Unconditional here, unlike purge_session_plaintext: the loop below converts every profile that was reading it.
+    # Unconditional here, unlike purge_session_plaintext: the reshape below converts every profile reading it.
     _purge_plaintext_token(session_name)
 
-    converted, already, skeletons = 0, 0, []
-    for profile, cfg in _session_profiles(session_name, full_config):
-        if _is_secure(cfg):
-            already += 1
-            continue
-        account_id, role = cfg.get('sso_account_id'), cfg.get('sso_role_name')
-        if not (account_id and role):
-            skeletons.append(profile)  # an incomplete profile — nothing to move into brolly_sso_*
-            continue
-        _secure_profile(profile, account_id, role, cfg.get('sso_account_name'))
-        converted += 1
+    reshaped = _reshape_session_profiles(session_name, full_config)
+    converted, resolving = len(reshaped.converted), len(reshaped.converted) + len(reshaped.already)
 
     print(f"✓ secure mode on for session '{session_name}' — its token now lives in the OS keychain")
-    if converted or already:
-        print(f'  {converted + already} profile(s) resolve credentials through it ({converted} converted just now)')
-    if skeletons:
+    if resolving:
+        print(f'  {resolving} profile(s) resolve credentials through it ({converted} converted just now)')
+    if reshaped.skeletons:
         print(
-            f'  no account/role set yet, so left alone: {", ".join(skeletons)}\n'
+            f'  no account/role set yet, so left alone: {", ".join(reshaped.skeletons)}\n'
             f'  finish one with `AWS_PROFILE=<profile> brolly switch` — it will be written in secure shape'
         )
-    elif not (converted or already):
+    elif not resolving:
         print(f'  it has no profiles yet — `brolly add <profile> -s {session_name}` creates one already secured')
 
 

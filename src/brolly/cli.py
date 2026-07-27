@@ -418,11 +418,14 @@ def _session_is_secure(session_name: SessionName, full_config: AwsConfig) -> boo
 def _enter_secure_session(session_name: SessionName, full_config: AwsConfig) -> ModuleType:
     """The single door into the keychain paths — returns the keychain module, having run what every secure
     command owes the session first: back-fill the secured-session record (for one secured by an older brolly),
-    then clear any plaintext token still on disk. Neither may wait for a command that actually authenticates.
+    heal any profile left in stock shape, then clear the plaintext token that healing made redundant. None of the
+    three may wait for a command that actually authenticates, and the order is load-bearing — healing is what
+    removes the last reader of the blob, so the purge after it needs no exception.
     """
     from brolly import keychain
 
     _record_secured_session(session_name, True)
+    keychain.heal_session_profiles(session_name, full_config)
     keychain.purge_session_plaintext(session_name, full_config)
     return keychain
 
@@ -435,6 +438,27 @@ def _secure_mode_tip(session_name: SessionName, full_config: AwsConfig) -> None:
         f"{_DIM}tip: 'brolly secure enable -s {session_name}' keeps this session's token in your OS keychain, "
         f'not ~/.aws/sso/cache{_RESET}',
         file=sys.stderr,
+    )
+
+
+def _unsecured_profile_error(profile: ProfileName, session: SessionName, cfg: AwsConfig) -> str:
+    """Why a profile that is not in secure shape under a secured session resolves nothing, and what fixes it.
+
+    Dispatch heals every stock profile before the command runs, so the live case is the one healing cannot touch:
+    a profile with no account/role to move, which only picking one can finish.
+    """
+    if not (cfg.get('sso_account_id') and cfg.get('sso_role_name')):
+        return (
+            f"profile '{profile}' has no account/role set, so nothing can resolve credentials for it.\n"
+            f'  Finish it:  AWS_PROFILE={profile} brolly switch  '
+            f"— under the secured session '{session}' it will be written in secure shape"
+        )
+    return (
+        f"profile '{profile}' still carries the stock sso_account_id/sso_role_name while its session '{session}' "
+        f'is secured, so it looks for credentials in ~/.aws/sso/cache — which secure mode deliberately keeps '
+        f'empty. Logging in again cannot fix it.\n'
+        f'  Convert it:  brolly secure enable -s {session}\n'
+        f'  Or move the whole session back to the plaintext cache:  brolly secure disable -s {session}'
     )
 
 
@@ -463,15 +487,8 @@ def cmd_refresh(
     )
     if check.returncode != 0:
         if secure and not _is_secure(profiles[target_profile]):
-            # a stock profile under a secured session reads ~/.aws/sso/cache, which secure mode keeps empty — no
-            # amount of logging in fixes that, so say what is actually wrong instead of failing again after one
-            raise SystemExit(
-                f"profile '{target_profile}' still carries the stock sso_account_id/sso_role_name while its "
-                f"session '{actual}' is secured, so it looks for credentials in ~/.aws/sso/cache — which secure "
-                f'mode deliberately keeps empty. Logging in again cannot fix it.\n'
-                f'  Convert it:  brolly secure enable -s {actual}\n'
-                f'  Or move the whole session back to the plaintext cache:  brolly secure disable -s {actual}'
-            )
+            # no amount of logging in fixes a profile that resolves nowhere, so say what is actually wrong
+            raise SystemExit(_unsecured_profile_error(target_profile, actual, profiles[target_profile]))
         print(f'{target_profile}: credentials unavailable — logging in…', file=sys.stderr)
         if secure:
             from brolly import keychain
