@@ -1025,6 +1025,114 @@ def test_secure_disable_removes_the_secured_session_record(aws_env, monkeypatch)
     assert _SESSION not in keychain._read_config().get('secured_sessions', [])
 
 
+def _stored_keychain_session(keyring_module: _FakeKeyring) -> str:
+    """Put a live token and its sidecar in the fake keychain, as a genuinely secured session has — the delete branch
+    of `disable` never runs against an empty one."""
+    cache_key = keychain._cache_key(_SESSION)
+    keyring_module.set_password('brolly-sso', cache_key, json.dumps(_live_blob()))
+    keychain._write_sidecar(_SESSION, cache_key, (datetime.now(UTC) + timedelta(hours=8)).isoformat(), True)
+    return cache_key
+
+
+def test_secure_disable_writes_the_stock_keys_back_and_drops_the_brolly_ones(aws_env, monkeypatch, capsys):
+    """The revert itself, on disk. This is the documented way out of secure mode, and a profile left carrying
+    `credential_process` and no sso_account_id after it resolves nothing at all: brolly no longer holds its token,
+    and botocore's SSO provider has nothing to activate on."""
+    _write_config(aws_env, secure=True)
+    keychain._record_secured_session(_SESSION, True)
+    fake_keyring = _FakeKeyring()
+    cache_key = _stored_keychain_session(fake_keyring)
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake_keyring)
+
+    keychain.cmd_secure_disable(_SESSION, botocore.session.Session().full_config)
+
+    cfg = botocore.session.Session(profile=_PROFILE).get_scoped_config()
+    assert cfg['sso_account_id'] == _ACCOUNT  # back to the shape botocore's SSO credential provider activates on
+    assert cfg['sso_role_name'] == _ROLE
+    assert cfg['sso_session'] == _SESSION
+    assert 'credential_process' not in cfg
+    assert 'brolly_sso_account_id' not in cfg
+    assert 'brolly_sso_role_name' not in cfg
+    assert fake_keyring.get_password('brolly-sso', cache_key) is None  # the token really left the keychain
+    assert not keychain._sidecar_path(cache_key).exists()
+    assert _SESSION not in keychain._read_config().get('secured_sessions', [])
+    assert '1 profile(s) back to the stock cache' in capsys.readouterr().out
+
+
+def test_secure_disable_reverts_the_profiles_even_when_the_keychain_refuses(aws_env, monkeypatch, capsys):
+    """Why the revert runs first and the token delete is allowed to fail: the usual reason to reach for `disable` is
+    a backend that has stopped working — an uninstalled package, a gpg-agent that will not unlock — and a keychain
+    that raises must not turn a completed revert into a failed command."""
+
+    class Locked(_FakeKeyring):
+        def delete_password(self, service: str, username: str) -> None:
+            raise self.errors.KeyringError('the keyring is locked')
+
+    _write_config(aws_env, secure=True)
+    keychain._record_secured_session(_SESSION, True)
+    fake_keyring = Locked()
+    cache_key = _stored_keychain_session(fake_keyring)
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake_keyring)
+
+    keychain.cmd_secure_disable(_SESSION, botocore.session.Session().full_config)  # must not raise
+
+    cfg = botocore.session.Session(profile=_PROFILE).get_scoped_config()
+    assert cfg['sso_account_id'] == _ACCOUNT
+    assert cfg['sso_role_name'] == _ROLE
+    assert 'credential_process' not in cfg
+    assert 'brolly_sso_account_id' not in cfg
+    assert _SESSION not in keychain._read_config().get('secured_sessions', [])  # never silently re-secured
+    assert not keychain._sidecar_path(cache_key).exists()  # nothing reads the entry now, so nothing describes it
+    captured = capsys.readouterr()
+    assert _SESSION in captured.err and 'could not be removed' in captured.err  # named, not swallowed
+    assert '1 profile(s) back to the stock cache' in captured.out
+
+
+def test_secure_disable_removes_the_sidecar_even_when_no_keychain_entry_existed(aws_env, monkeypatch):
+    """An interrupted disable (or a keychain wiped from outside) leaves the entry gone and its sidecar behind, and
+    `ls` reads the sidecar — so it would go on reporting an expiry for a secret that no longer exists."""
+    _write_config(aws_env, secure=True)
+    cache_key = keychain._cache_key(_SESSION)
+    keychain._write_sidecar(_SESSION, cache_key, (datetime.now(UTC) + timedelta(hours=8)).isoformat(), True)
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: _FakeKeyring())  # empty: nothing stored
+
+    keychain.cmd_secure_disable(_SESSION, botocore.session.Session().full_config)
+
+    assert not keychain._sidecar_path(cache_key).exists()
+
+
+def test_secure_disable_explains_a_half_converted_profile_instead_of_raising(aws_env, monkeypatch, capsys):
+    """A conversion interrupted between its two `aws configure set` calls leaves brolly_sso_account_id with no role
+    under either name. There is nothing to revert it to, which is a sentence to print — not a KeyError traceback in
+    the middle of the one command that gets a user out of secure mode."""
+    aws_env.write_text(
+        '\n'.join([
+            '[sso-session corp]',
+            'sso_start_url = https://corp.awsapps.com/start',
+            'sso_region = us-east-1',
+            '',
+            f'[profile {_PROFILE}]',
+            'sso_session = corp',
+            'region = us-east-1',
+            'brolly_sso_account_id = 222222222222',
+            f'credential_process = brolly credential-process --profile {_PROFILE}',
+        ])
+        + '\n'
+    )
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: _FakeKeyring())
+
+    keychain.cmd_secure_disable(_SESSION, botocore.session.Session().full_config)
+
+    assert botocore.session.Session(profile=_PROFILE).get_scoped_config() == {
+        'sso_session': _SESSION,
+        'region': 'us-east-1',
+    }
+    captured = capsys.readouterr()
+    assert _PROFILE in captured.err
+    assert 'brolly switch' in captured.err  # names the command that can finish it
+    assert '0 profile(s) back to the stock cache' in captured.out  # and does not claim a revert it did not make
+
+
 def test_purge_plaintext_token_removes_a_planted_file_and_reports_it(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv('HOME', str(tmp_path))
     cache_dir = tmp_path / '.aws' / 'sso' / 'cache'

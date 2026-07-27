@@ -354,12 +354,20 @@ class _KeychainTokenCache:
         self._run(self._keyring.set_password, _KEYRING_SERVICE, cache_key, json.dumps(value, default=_json_default))
         _write_sidecar(self._session_name, cache_key, value.get('expiresAt'), 'refreshToken' in value)
 
-    def __delitem__(self, cache_key: str) -> None:
+    def _delete(self, cache_key: str) -> None:
+        """Delete raw, translating only "no such entry" — every other backend failure is left to ``_run``."""
         try:
             self._keyring.delete_password(_KEYRING_SERVICE, cache_key)
         except self._keyring.errors.PasswordDeleteError:
             raise KeyError(cache_key) from None
-        _remove_sidecar(cache_key)
+
+    def __delitem__(self, cache_key: str) -> None:
+        """Drop the token and the sidecar describing it — the sidecar goes even when the entry was already absent,
+        or an interrupted disable leaves `ls` reading an expiry for a secret that no longer exists."""
+        try:
+            self._run(self._delete, cache_key)
+        finally:
+            _remove_sidecar(cache_key)
 
 
 _SECTION_HEADER = re.compile(r'\[(?P<header>.+)\]')
@@ -759,21 +767,60 @@ def cmd_secure_enable(session_name: SessionName, full_config: AwsConfig, backend
         raise SystemExit(1)
 
 
+def _delete_keychain_token(session_name: SessionName) -> None:
+    """Drop the session's keychain entry (and its sidecar), reporting rather than raising if the backend refuses.
+
+    Only `secure disable` calls this, and by then the profiles are already back to stock: an unreachable keychain
+    must not turn a completed revert into a failed command. What it leaves behind is inert — nothing reads that
+    entry once the session is no longer secured — so a named warning is the whole remedy.
+    """
+    cache_key = _cache_key(session_name)
+    try:
+        cache = _KeychainTokenCache(_configured_keyring(), session_name)
+        with suppress(KeyError):
+            del cache[cache_key]
+    except SystemExit as x:
+        print(
+            f"! the OS keychain entry for session '{session_name}' could not be removed: {x}\n"
+            f'  Nothing reads it now, but delete it yourself if you would rather it were gone.',
+            file=sys.stderr,
+        )
+        _remove_sidecar(cache_key)
+
+
 def cmd_secure_disable(session_name: SessionName, full_config: AwsConfig) -> None:
-    """Revert every secured profile under the session to a stock plaintext-cache SSO profile and purge the token."""
-    keyring_module = _configured_keyring()
+    """Revert every secured profile under the session to a stock plaintext-cache SSO profile and purge the token.
+
+    Ordered so it still works when the keychain does not. This is the documented way out of secure mode, and the
+    reason to reach for it is often that the backend has become unusable — an uninstalled backend package, a
+    gpg-agent that will not unlock — so the profile revert, which needs no keyring at all, runs first and the token
+    deletion is a separate step allowed to fail. The record is dropped before that step for the same reason: a
+    session whose profiles are back to stock while brolly still calls it secured would be silently re-secured by
+    the next command.
+    """
     reverted = 0
     for profile, cfg in _session_profiles(session_name, full_config):
         if not _is_secure(cfg):
             continue
-        _aws('configure', 'set', 'sso_account_id', cfg['brolly_sso_account_id'], '--profile', profile)
-        _aws('configure', 'set', 'sso_role_name', cfg['brolly_sso_role_name'], '--profile', profile)
+        # a conversion interrupted between its two `aws configure set` calls leaves no brolly role but its stock
+        # keys still in place — reverting to those is exactly right, and beats a KeyError traceback
+        account_id = cfg.get('brolly_sso_account_id') or cfg.get('sso_account_id')
+        role = cfg.get('brolly_sso_role_name') or cfg.get('sso_role_name')
+        if account_id and role:
+            _aws('configure', 'set', 'sso_account_id', account_id, '--profile', profile)
+            _aws('configure', 'set', 'sso_role_name', role, '--profile', profile)
+            reverted += 1
+        else:
+            print(
+                f"! '{profile}' has no role recorded under either brolly_sso_role_name or sso_role_name, so there "
+                f'is nothing to revert it to — its brolly keys are removed, leaving it for '
+                f'`AWS_PROFILE={profile} brolly switch` to finish.',
+                file=sys.stderr,
+            )
         _config_remove_keys(profile, {'credential_process', 'brolly_sso_account_id', 'brolly_sso_role_name'})
-        reverted += 1
 
-    with suppress(KeyError):
-        del _KeychainTokenCache(keyring_module, session_name)[_cache_key(session_name)]
     _record_secured_session(session_name, False)
+    _delete_keychain_token(session_name)
     print(f"✓ secure mode off for session '{session_name}' — {reverted} profile(s) back to the stock cache")
 
 
