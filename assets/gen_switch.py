@@ -57,14 +57,17 @@ def _sso_client(*_args, **_kwargs) -> SimpleNamespace:
 
 def capture_switch() -> list[list]:
     """Run the real `switch` with the network, the keyboard, and the config writes stubbed out."""
-    cli._profile_sso = lambda profile: (SESSION, REGION, WAS[0], ROLE)
-    cli._ensure_token = lambda profile, session: 'token'
-    cli._aws = lambda *args, **kwargs: None  # `aws configure set` — nothing to write for an illustration
-    cli.boto3 = SimpleNamespace(client=_sso_client)
-    cli._read_key = lambda: next(KEYS)
+    cli._profile_sso = lambda profile: (SESSION, REGION, WAS[0], ROLE)  # ty: ignore[invalid-assignment]
+    cli._ensure_token = lambda profile, session: 'token'  # ty: ignore[invalid-assignment]
+    # `aws configure set` — nothing to write for an illustration
+    cli._aws = lambda *args, **kwargs: None  # ty: ignore[invalid-assignment]
+    cli.boto3 = SimpleNamespace(client=_sso_client)  # ty: ignore[invalid-assignment]
+    cli._read_key = lambda: next(KEYS)  # ty: ignore[invalid-assignment]
     # the picker puts the terminal in cbreak mode and restores it afterwards; neither applies to a fake tty
-    cli.termios = SimpleNamespace(tcgetattr=lambda fd: None, tcsetattr=lambda fd, when, attrs: None, TCSADRAIN=0)
-    cli.tty = SimpleNamespace(setcbreak=lambda fd: None)
+    cli.termios = SimpleNamespace(  # ty: ignore[invalid-assignment]
+        tcgetattr=lambda fd: None, tcsetattr=lambda fd, when, attrs: None, TCSADRAIN=0
+    )
+    cli.tty = SimpleNamespace(setcbreak=lambda fd: None)  # ty: ignore[invalid-assignment]
 
     return record(lambda: cli.cmd_switch(PROFILE)).trimmed()
 
