@@ -104,11 +104,11 @@ def capture_ls() -> list[list]:
         def now(cls, tz=None):
             return NOW.astimezone(tz) if tz else NOW
 
-    cli.datetime = _Frozen
-    cli._expiry_path = lambda session, config, secure: Path(session)
-    cli._state_for = lambda path: SESSION_STATE[path.name][0]
-    cli._read_expiry = lambda path: SESSION_STATE[path.name][1]
-    cli._read_refreshable = lambda path, secure: SESSION_STATE[path.name][2]
+    cli.datetime = _Frozen  # ty: ignore[invalid-assignment]  — subclass swap to freeze `now()`
+    cli._expiry_path = lambda session, config, secure: Path(session)  # ty: ignore[invalid-assignment]
+    cli._state_for = lambda path: SESSION_STATE[path.name][0]  # ty: ignore[invalid-assignment]
+    cli._read_expiry = lambda path: SESSION_STATE[path.name][1]  # ty: ignore[invalid-assignment]
+    cli._read_refreshable = lambda path, secure: SESSION_STATE[path.name][2]  # ty: ignore[invalid-assignment]
 
     return record(lambda: cli.cmd_ls(FULL_CONFIG, CURRENT, check=False)).trimmed()
 

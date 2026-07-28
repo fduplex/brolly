@@ -152,7 +152,9 @@ the migration.
                     ! ~/.aws/sso/cache still holds its token — the next brolly command using this session clears it, or `brolly secure enable -s corp` now
 ```
 
-`ls` only reports — it never deletes or rewrites anything. The next command that enters the session does.
+`ls` never edits `~/.aws/config` or deletes the plaintext cache, but the default probe above isn't purely passive: a
+successful silent refresh rotates that session's token and rewrites its keychain entry and expiry sidecar as it
+runs. `--no-check` is the only mode that touches nothing at all.
 
 #### Reading the expiry
 

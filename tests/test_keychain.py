@@ -1234,7 +1234,7 @@ def test_device_login_warns_when_no_refresh_token_is_issued(aws_env, monkeypatch
     assert 'refreshToken' not in blob  # nothing fabricated
     assert json.loads(keychain._sidecar_path(keychain._cache_key(_SESSION)).read_text())['refreshable'] is False
     err = capsys.readouterr().err
-    assert 'no refresh token' in err and 'sso:account:access' in err  # loud, and says what to check
+    assert 'no refresh token' in err and 'administrator' in err and _SESSION in err  # loud, and says where to look
 
 
 def test_secure_enable_reauthorizes_a_stored_token_that_cannot_renew(aws_env, monkeypatch, capsys):

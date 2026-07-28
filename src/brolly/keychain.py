@@ -897,7 +897,8 @@ def _device_login(session_name: SessionName, sso_config: AwsConfig, cache: _Keyc
         print(
             f'! IAM Identity Center issued no refresh token for this session, so it cannot renew silently — '
             f'expect another device login at {expires_at.astimezone():%Y-%m-%d %H:%M}.\n'
-            f"  Check that the '{session_name}' sso-session is allowed the {_ACCOUNT_SCOPE} scope.",
+            f"  If that's unexpected, ask your Identity Center administrator about the '{session_name}' "
+            f'sso-session configuration.',
             file=sys.stderr,
         )
 

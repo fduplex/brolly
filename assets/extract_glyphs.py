@@ -45,6 +45,9 @@ _OUT = Path(__file__).parent / 'nerd-glyphs.json'
 def main(font_path: str) -> int:
     font = TTFont(font_path)
     cmap, glyphs = font.getBestCmap(), font.getGlyphSet()
+    if cmap is None:
+        print(f'{font_path}: font has no usable cmap', file=sys.stderr)
+        return 1
 
     out: dict[str, dict] = {}
     for name, codepoint in WANTED.items():
@@ -55,10 +58,14 @@ def main(font_path: str) -> int:
         path_pen, bounds_pen = SVGPathPen(glyphs, ntos=lambda v: f'{v:.0f}'), BoundsPen(glyphs)
         glyphs[glyph_name].draw(path_pen)
         glyphs[glyph_name].draw(bounds_pen)
+        bounds = bounds_pen.bounds
+        if bounds is None:
+            print(f'{font_path}: glyph {glyph_name!r} ({name}) has no outline', file=sys.stderr)
+            return 1
         out[name] = {
             'codepoint': f'U+{codepoint:04X}',
             'glyph': glyph_name,
-            'bounds': [round(v, 1) for v in bounds_pen.bounds],
+            'bounds': [round(v, 1) for v in bounds],
             'd': path_pen.getCommands(),
         }
 
@@ -66,7 +73,9 @@ def main(font_path: str) -> int:
         '_source': f'{Path(font_path).name} (Nerd Fonts symbols-only release)',
         '_license': 'dev-aws: Devicons, MIT. fa-*: Font Awesome Free, icons CC BY 4.0.',
         '_regenerate': 'uv run python assets/extract_glyphs.py <SymbolsNerdFont-Regular.ttf>',
-        'units_per_em': font['head'].unitsPerEm,
+        # unitsPerEm is set dynamically by sstruct.unpack2() when the `head` table is decompiled, so it isn't
+        # visible to the type checker as a static attribute.
+        'units_per_em': getattr(font['head'], 'unitsPerEm'),  # noqa: B009 — attr is set dynamically by sstruct
         'glyphs': out,
     }
     _OUT.write_text(json.dumps(payload, indent=2) + '\n')
