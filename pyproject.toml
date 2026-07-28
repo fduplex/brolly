@@ -1,6 +1,6 @@
 [project]
 name = 'brolly'
-version = '0.3.1'
+version = '0.4.0'
 description = 'A pure-Python CLI for AWS IAM Identity Center (SSO)'
 authors = [
   { name = 'Full Duplex Media', email = 'contact@fullduplex.media' }
