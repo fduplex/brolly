@@ -141,13 +141,16 @@ _ACCOUNT = '222222222222'
 _ROLE = 'AdministratorAccess'
 
 
-def _write_config(path, *, secure: bool) -> None:
+def _write_config(path, *, secure: bool, header: str = f'[profile {_PROFILE}]') -> None:
+    """The one-profile session every simple test runs against. ``header`` spells that profile's section header —
+    the default is the plain form, and a caller passes one of ``_HEADER_FORMS`` to put a profile botocore reads and
+    `aws configure set` does not in front of a command."""
     lines = [
         '[sso-session corp]',
         'sso_start_url = https://corp.awsapps.com/start',
         'sso_region = us-east-1',
         '',
-        '[profile corp-prod]',
+        header,
         'sso_session = corp',
         'region = us-east-1',
     ]
@@ -542,17 +545,47 @@ def test_autodetect_uses_active_os_keychain(monkeypatch):
     assert keychain._autodetect_backend(fake) == 'keyring.backends.macOS.Keyring'
 
 
-def test_keychain_cache_translates_backend_failure(aws_env, monkeypatch):
+def _locked_error(fake: _FakeKeyring, kind: str) -> Exception:
+    """What a backend that will not unlock raises — and it is not one class.
+
+    `keyring`'s documented contract is ``KeyringError``, but ``keyring_pass`` raises a bare ``RuntimeError`` when
+    gpg-agent refuses to unlock: brolly's bundled desktop-less recommendation, failing in exactly the way `secure
+    disable` exists to get the user out of. A fake that only ever raised the class brolly already handled would
+    prove nothing about the backend brolly actually ships people toward.
+    """
+    return RuntimeError('gpg: decryption failed') if kind == 'runtime' else fake.errors.KeyringError('keyring locked')
+
+
+_LOCKED_KINDS = ['runtime', 'keyring']
+
+
+@pytest.mark.parametrize('kind', _LOCKED_KINDS)
+def test_keychain_cache_translates_backend_failure(kind, aws_env, monkeypatch):
     monkeypatch.setenv('AWS_CONFIG_FILE', str(aws_env))
     fake = _FakeKeyring()
 
     def boom(*_):
-        raise fake.errors.KeyringError('keyring is locked')
+        raise _locked_error(fake, kind)
 
     monkeypatch.setattr(fake, 'get_password', boom)
     cache = keychain._KeychainTokenCache(fake, _SESSION)
     with pytest.raises(SystemExit, match='OS keychain access failed'):
         _ = keychain._cache_key(_SESSION) in cache
+
+
+@pytest.mark.parametrize('kind', _LOCKED_KINDS)
+def test_preflight_keychain_reports_a_locked_backend_rather_than_tracebacking(kind, aws_env, monkeypatch):
+    """The preflight's whole job is to fail cleanly while ~/.aws is still untouched — a backend class brolly does
+    not catch turns that into a traceback out of the first read it makes."""
+    fake = _FakeKeyring()
+
+    def boom(*_):
+        raise _locked_error(fake, kind)
+
+    monkeypatch.setattr(fake, 'get_password', boom)
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake)
+    with pytest.raises(SystemExit, match='OS keychain access failed'):
+        keychain.preflight_keychain(_SESSION)
 
 
 def test_remove_plaintext_token(tmp_path, monkeypatch):
@@ -1133,9 +1166,17 @@ def test_credential_process_reports_dead_token(aws_env, monkeypatch):
 _SSO_CONFIG = {'sso_start_url': 'https://corp.awsapps.com/start', 'sso_region': 'us-east-1'}
 
 
-def _login(monkeypatch, keyring_module, *, oidc: _FakeOidc, sso_config: dict | None = None) -> None:
+def _stub_device_login_transport(monkeypatch, oidc: _FakeOidc | None = None) -> _FakeOidc:
+    """Let a *real* ``_device_login`` run offline: no polling sleeps, and the sso-oidc client faked. Commands stubbed
+    this way still take the whole login path, which is the only way the purge that follows one can be observed."""
+    fake = oidc if oidc is not None else _FakeOidc()
     monkeypatch.setattr(keychain, 'sleep', lambda _: None)
-    monkeypatch.setattr(keychain.boto3, 'client', lambda *a, **k: oidc)
+    monkeypatch.setattr(keychain.boto3, 'client', lambda *a, **k: fake)
+    return fake
+
+
+def _login(monkeypatch, keyring_module, *, oidc: _FakeOidc, sso_config: dict | None = None) -> None:
+    _stub_device_login_transport(monkeypatch, oidc)
     cache = keychain._KeychainTokenCache(keyring_module, _SESSION)
     keychain._device_login(_SESSION, sso_config or _SSO_CONFIG, cache)
 
@@ -1217,6 +1258,67 @@ def test_secure_enable_reauthorizes_a_stored_token_that_cannot_renew(aws_env, mo
     assert 'cannot renew silently' in capsys.readouterr().err
 
 
+def test_secure_enable_reauthorizing_a_stranded_token_still_spares_an_unconvertible_profiles_blob(
+    aws_env, monkeypatch, capsys
+):
+    """`enable` re-authorizes a stored token that cannot renew *before* it reshapes the profiles, so the login is
+    the earliest point in the command — earlier than any healing. A purge riding on it would delete the blob while
+    `corp-foreign` was still the only thing reading it, and before the run had even tried to convert it."""
+    _write_foreign_credential_process_config(aws_env)
+    token = _plant_plaintext_token(client_id='client-corp')
+    stale_bytes = token.read_bytes()
+    fake_keyring = _FakeKeyring()
+    stranded = {'accessToken': 'stale-tok', 'expiresAt': (datetime.now(UTC) + timedelta(hours=8)).isoformat()}
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(stranded))
+    _stub_keyring_backend(monkeypatch, fake_keyring)
+    _stub_device_login_transport(monkeypatch)
+
+    with pytest.raises(SystemExit) as exc_info:
+        keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    assert exc_info.value.code == 1
+    assert _stored_blob(fake_keyring)['refreshToken'] == 'refresh-tok'  # the re-authorization did run
+    assert token.read_bytes() == stale_bytes
+    captured = capsys.readouterr()
+    assert f'could not convert, so still resolving from ~/.aws/sso/cache: {_FOREIGN}' in captured.out
+    assert 'removed plaintext token cache' not in captured.err  # the run does not contradict the line above
+
+
+def test_secure_enable_with_no_stored_token_spares_an_unconvertible_profiles_blob(aws_env, monkeypatch, capsys):
+    """The other login `enable` can run — no keychain entry at all — sitting at the same point in the command."""
+    _write_foreign_credential_process_config(aws_env)
+    token = _plant_plaintext_token(client_id='client-corp')
+    stale_bytes = token.read_bytes()
+    fake_keyring = _FakeKeyring()
+    _stub_keyring_backend(monkeypatch, fake_keyring)
+    _stub_device_login_transport(monkeypatch)
+
+    with pytest.raises(SystemExit) as exc_info:
+        keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    assert exc_info.value.code == 1
+    assert _stored_blob(fake_keyring)['accessToken'] == 'access-tok'
+    assert token.read_bytes() == stale_bytes
+    captured = capsys.readouterr()
+    assert f'could not convert, so still resolving from ~/.aws/sso/cache: {_FOREIGN}' in captured.out
+    assert 'removed plaintext token cache' not in captured.err
+
+
+def test_secure_enable_with_no_stored_token_still_purges_once_every_profile_has_converted(aws_env, monkeypatch, capsys):
+    _write_config(aws_env, secure=False)
+    token = _plant_plaintext_token(client_id='client-corp')
+    registration = _plant_registration(_aws_cli_registration_key(), 'client-corp')
+    fake_keyring = _FakeKeyring()
+    _stub_keyring_backend(monkeypatch, fake_keyring)
+    _stub_device_login_transport(monkeypatch)
+
+    keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    assert not token.exists()
+    assert not registration.exists()
+    assert f"removed plaintext token cache for session '{_SESSION}'" in capsys.readouterr().err
+
+
 def test_secure_enable_keeps_a_stored_token_that_can_renew(aws_env, monkeypatch, capsys):
     _write_config(aws_env, secure=False)
     fake_keyring = _FakeKeyring()
@@ -1257,6 +1359,66 @@ def test_secure_enable_writes_the_secured_session_record(aws_env, monkeypatch):
     assert _SESSION not in keychain._read_config().get('secured_sessions', [])
     keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
     assert _SESSION in keychain._read_config()['secured_sessions']
+
+
+class _LockedKeyring(_FakeKeyring):
+    """A backend that loads and then refuses the first real operation — the `pass` store whose gpg-agent will not
+    unlock headless, which is precisely what ``_select_backend`` alone cannot detect."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__()
+        self._kind = kind
+
+    def get_password(self, service: str, username: str) -> str | None:
+        raise _locked_error(self, self._kind)
+
+
+@pytest.mark.parametrize('kind', _LOCKED_KINDS)
+def test_secure_enable_does_not_save_a_backend_it_could_not_use(kind, aws_env, monkeypatch):
+    """Saving the backend before proving it is a blocker, not a cosmetic ordering: ``_configured_keyring`` selects the
+    saved value unconditionally, so a backend persisted by a run that then failed forces *every* later brolly command
+    — `credential-process` for other, healthy sessions included — onto a backend nothing can read."""
+    _write_config(aws_env, secure=False)
+    before = aws_env.read_text()
+    _stub_keyring_backend(monkeypatch, _LockedKeyring(kind))
+
+    with pytest.raises(SystemExit, match='OS keychain access failed'):
+        keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    saved = keychain._read_config()
+    assert 'keyring_backend' not in saved
+    assert _SESSION not in saved.get('secured_sessions', [])
+    assert aws_env.read_text() == before
+
+
+@pytest.mark.parametrize('kind', _LOCKED_KINDS)
+def test_secure_enable_keeps_the_working_saved_backend_when_a_named_one_fails(kind, aws_env, monkeypatch):
+    """The degradation this prevents, at its sharpest: a machine already secured against a backend that works, and a
+    `secure enable --backend <broken>` that fails. The saved backend every other session resolves through must come
+    out of that run exactly as it went in."""
+    _write_config(aws_env, secure=False)
+    keychain._write_config({**keychain._read_config(), 'keyring_backend': 'working.Backend'})
+    _stub_keyring_backend(monkeypatch, _LockedKeyring(kind))
+
+    with pytest.raises(SystemExit, match='OS keychain access failed'):
+        keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config, backend='broken.Backend')
+
+    assert keychain._read_config()['keyring_backend'] == 'working.Backend'
+
+
+def test_secure_enable_saves_the_backend_once_it_has_proved_usable(aws_env, monkeypatch, capsys):
+    """The other half of the reorder: a backend that answers its probing read is still persisted, and the line that
+    announces it is only printed once that is true."""
+    _write_config(aws_env, secure=False)
+    fake_keyring = _FakeKeyring()
+    good = {**_live_blob(), 'refreshToken': 'already-good'}
+    fake_keyring.set_password('brolly-sso', keychain._cache_key(_SESSION), json.dumps(good))
+    _stub_keyring_backend(monkeypatch, fake_keyring)
+
+    keychain.cmd_secure_enable(_SESSION, botocore.session.Session().full_config)
+
+    assert keychain._read_config()['keyring_backend'] == 'fake.Backend'
+    assert 'keychain backend: fake' in capsys.readouterr().err
 
 
 def test_secure_disable_removes_the_secured_session_record(aws_env, monkeypatch):
@@ -1303,14 +1465,20 @@ def test_secure_disable_writes_the_stock_keys_back_and_drops_the_brolly_ones(aws
     assert '1 profile(s) back to the stock cache' in capsys.readouterr().out
 
 
-def test_secure_disable_reverts_the_profiles_even_when_the_keychain_refuses(aws_env, monkeypatch, capsys):
+@pytest.mark.parametrize('kind', _LOCKED_KINDS)
+def test_secure_disable_reverts_the_profiles_even_when_the_keychain_refuses(kind, aws_env, monkeypatch, capsys):
     """Why the revert runs first and the token delete is allowed to fail: the usual reason to reach for `disable` is
     a backend that has stopped working — an uninstalled package, a gpg-agent that will not unlock — and a keychain
-    that raises must not turn a completed revert into a failed command."""
+    that raises must not turn a completed revert into a failed command.
+
+    Run against both classes a real backend refuses with (see ``_locked_error``): ``keyring_pass`` raises
+    ``RuntimeError`` for the gpg-agent case this docstring names, so catching only ``KeyringError`` would traceback
+    on the one failure `disable` is most often reached for.
+    """
 
     class Locked(_FakeKeyring):
         def delete_password(self, service: str, username: str) -> None:
-            raise self.errors.KeyringError('the keyring is locked')
+            raise _locked_error(self, kind)
 
     _write_config(aws_env, secure=True)
     keychain._record_secured_session(_SESSION, True)
@@ -1377,23 +1545,76 @@ def test_secure_disable_explains_a_half_converted_profile_instead_of_raising(aws
     assert '0 profile(s) back to the stock cache' in captured.out  # and does not claim a revert it did not make
 
 
-def test_purge_plaintext_token_removes_a_planted_file_and_reports_it(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv('HOME', str(tmp_path))
-    cache_dir = tmp_path / '.aws' / 'sso' / 'cache'
-    cache_dir.mkdir(parents=True)
-    token = cache_dir / f'{keychain._cache_key(_SESSION)}.json'
-    token.write_text('{"accessToken": "plaintext-cruft", "refreshToken": "leaked"}')
+def test_secure_disable_will_not_report_success_for_a_revert_that_did_not_land(aws_env, monkeypatch, capsys):
+    """The lockout this exists to stop. `[profile  corp-prod]` — two spaces, a header the AWS CLI and botocore both
+    tolerate and real configs really carry — is read as `corp-prod` by botocore and not matched by `aws configure
+    set`, so the revert lands in a *second* section that shadows the first: the profile ends up with neither
+    `sso_session` nor the `credential_process` it was resolving by. Reporting that as `✓ secure mode off` and
+    deleting the keychain token on top of it leaves the user with no credentials at all and a success message.
+    """
+    _write_config(aws_env, secure=True, header=f'[profile  {_PROFILE}]')
+    keychain._record_secured_session(_SESSION, True)
+    fake_keyring = _FakeKeyring()
+    cache_key = _stored_keychain_session(fake_keyring)
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake_keyring)
 
-    keychain._purge_plaintext_token(_SESSION, _SSO_CONFIG)
+    with pytest.raises(SystemExit) as exc_info:
+        keychain.cmd_secure_disable(_SESSION, botocore.session.Session().full_config)
 
-    assert not token.exists()
-    assert f"removed plaintext token cache for session '{_SESSION}'" in capsys.readouterr().err
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert '✓ secure mode off' not in captured.out  # no success line over a revert that is not on disk
+    assert _PROFILE in captured.err  # the profile that needs a hand is named
+    assert fake_keyring.get_password('brolly-sso', cache_key) is not None  # the token it may still need is kept
+    assert keychain._sidecar_path(cache_key).exists()
+    assert _SESSION in keychain._read_config()['secured_sessions']  # and the session is still secured
+    # nothing was removed on the strength of a write that did not land: the original section is still intact
+    assert 'credential_process = brolly credential-process' in aws_env.read_text()
 
 
-def test_purge_plaintext_token_is_silent_and_safe_when_nothing_to_remove(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv('HOME', str(tmp_path))  # no ~/.aws/sso/cache at all
-    keychain._purge_plaintext_token(_SESSION, _SSO_CONFIG)  # must not raise
-    assert capsys.readouterr().err == ''
+def test_secure_disable_keeps_the_landed_revert_and_the_token_when_one_profile_fails(aws_env, monkeypatch, capsys):
+    """Partial success has to be visible as partial. The profile whose revert landed stays reverted — rolling it
+    back would be inventing a second failure — but the token survives for the one that did not, the exit is
+    non-zero, and both outcomes are reported rather than averaged into a count."""
+    aws_env.write_text(
+        '\n'.join([
+            '[sso-session corp]',
+            'sso_start_url = https://corp.awsapps.com/start',
+            'sso_region = us-east-1',
+            '',
+            f'[profile {_PROFILE}]',
+            'sso_session = corp',
+            'brolly_sso_account_id = 222222222222',
+            'brolly_sso_role_name = AdministratorAccess',
+            f'credential_process = brolly credential-process --profile {_PROFILE}',
+            '',
+            f'[profile  {_STOCK}]',  # two spaces: botocore reads it, `aws configure set` writes past it
+            'sso_session = corp',
+            'brolly_sso_account_id = 333333333333',
+            'brolly_sso_role_name = ReadOnly',
+            f'credential_process = brolly credential-process --profile {_STOCK}',
+        ])
+        + '\n'
+    )
+    keychain._record_secured_session(_SESSION, True)
+    fake_keyring = _FakeKeyring()
+    cache_key = _stored_keychain_session(fake_keyring)
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: fake_keyring)
+
+    with pytest.raises(SystemExit) as exc_info:
+        keychain.cmd_secure_disable(_SESSION, botocore.session.Session().full_config)
+
+    assert exc_info.value.code == 1
+    landed = botocore.session.Session(profile=_PROFILE).get_scoped_config()
+    assert landed['sso_account_id'] == _ACCOUNT  # the one that worked is left reverted, not rolled back
+    assert landed['sso_role_name'] == _ROLE
+    assert 'credential_process' not in landed
+    assert fake_keyring.get_password('brolly-sso', cache_key) is not None
+    assert _SESSION in keychain._read_config()['secured_sessions']
+    captured = capsys.readouterr()
+    assert '✓ secure mode off' not in captured.out
+    assert _STOCK in captured.err  # the failure is named
+    assert _PROFILE in captured.out + captured.err  # and so is what did land
 
 
 def test_purge_session_plaintext_removes_the_blob_when_nothing_still_needs_it(tmp_path, monkeypatch, capsys):
@@ -1622,29 +1843,102 @@ def test_purge_holds_the_registration_back_on_the_same_guard_as_the_token(tmp_pa
     assert _STOCK in err
 
 
-def test_device_login_purges_the_registration_the_previous_aws_login_left(aws_env, monkeypatch, capsys):
-    """brolly's own device login caches no registration to disk, so anything it finds is an `aws sso login`
-    leftover — and it has just replaced the token that leftover minted."""
+def test_device_login_deletes_nothing_from_the_plaintext_cache_itself(aws_env, monkeypatch, capsys):
+    """A device login stores a token and touches ~/.aws/sso/cache not at all. It used to purge unconditionally, on
+    the reasoning that a fresh keychain token makes the blob stale — which is true for brolly and false for a stock
+    profile, which cannot read the keychain and had that blob as its only credential. So the delete moved out to
+    the callers, where the guarded decision and the healing that informs it both live."""
     monkeypatch.setenv('AWS_CONFIG_FILE', str(aws_env))
     token = _plant_plaintext_token(client_id='client-corp')
     registration = _plant_registration(_UNRELATED_NAME, 'client-corp')
+    stale_bytes = token.read_bytes()
 
     _login(monkeypatch, _FakeKeyring(), oidc=_FakeOidc())
+
+    assert token.read_bytes() == stale_bytes
+    assert registration.is_file()
+    assert 'removed plaintext token cache' not in capsys.readouterr().err
+
+
+def _stub_secure_login_keychain(monkeypatch, keyring_module: _FakeKeyring) -> None:
+    """Point `login`'s keychain lookups at a fake, leaving the command itself real."""
+    monkeypatch.setattr(keychain, '_configured_keyring', lambda: keyring_module)
+    monkeypatch.setattr(keychain, '_backend_label', lambda _: 'fake')
+
+
+def test_secure_login_leaves_the_blob_a_profile_that_could_not_convert_still_resolves_from(
+    aws_env, monkeypatch, capsys
+):
+    """The lockout this whole ordering exists to prevent, at the seam `cli.main`'s login branch assembles:
+    ``_enter_secure_session`` heals and decides about the cache, then the login runs. `corp-foreign` carries a
+    credential helper of the user's own, so it cannot be converted and goes on resolving credentials out of
+    ~/.aws/sso/cache — and a login that deleted that blob would leave it resolving nothing at all until the user
+    ran `aws sso login`. The login is driven through the door rather than called bare because the door is what
+    purges: `cmd_secure_login` deletes nothing itself, and calling it alone would prove only that."""
+    from brolly import cli
+
+    _write_foreign_credential_process_config(aws_env)
+    token = _plant_plaintext_token(client_id='client-corp')
+    registration = _plant_registration(_aws_cli_registration_key(), 'client-corp')
+    stale_bytes = token.read_bytes()
+    fake_keyring = _FakeKeyring()  # empty, so a real `_device_login` runs
+    _stub_secure_login_keychain(monkeypatch, fake_keyring)
+    _stub_device_login_transport(monkeypatch)
+
+    full_config = botocore.session.Session().full_config
+    cli._enter_secure_session(_SESSION, full_config).cmd_secure_login(_SESSION, full_config)
+
+    assert _stored_blob(fake_keyring)['accessToken'] == 'access-tok'  # the login itself really happened
+    assert token.read_bytes() == stale_bytes  # byte for byte, not merely still present
+    assert registration.is_file()  # the registration is held back on the same guard
+    err = capsys.readouterr().err
+    assert f"session '{_SESSION}' is secured" in err and _FOREIGN in err  # says which profile holds it back
+    assert 'removed plaintext token cache' not in err  # and never claims a removal it did not make
+
+
+def test_secure_login_still_purges_the_blob_when_every_profile_resolves_from_the_keychain(aws_env, monkeypatch, capsys):
+    """The other half: deferring the purge must not become never purging. With nothing left reading the cache, a
+    login clears both files `aws sso login` leaves behind."""
+    from brolly import cli
+
+    _write_config(aws_env, secure=True)
+    token = _plant_plaintext_token(client_id='client-corp')
+    registration = _plant_registration(_aws_cli_registration_key(), 'client-corp')
+    fake_keyring = _FakeKeyring()
+    _stub_secure_login_keychain(monkeypatch, fake_keyring)
+    _stub_device_login_transport(monkeypatch)
+
+    full_config = botocore.session.Session().full_config
+    cli._enter_secure_session(_SESSION, full_config).cmd_secure_login(_SESSION, full_config)
 
     assert not token.exists()
     assert not registration.exists()
-
-
-def test_device_login_purges_a_planted_plaintext_token(aws_env, monkeypatch, capsys):
-    monkeypatch.setenv('AWS_CONFIG_FILE', str(aws_env))
-    plaintext = keychain._plaintext_token_path(_SESSION)
-    plaintext.parent.mkdir(parents=True)
-    plaintext.write_text('{"accessToken": "stale", "refreshToken": "leaked"}')
-
-    _login(monkeypatch, _FakeKeyring(), oidc=_FakeOidc())
-
-    assert not plaintext.is_file()
     assert f"removed plaintext token cache for session '{_SESSION}'" in capsys.readouterr().err
+
+
+def test_login_end_to_end_never_deletes_the_blob_it_has_just_said_it_left_alone(aws_env, monkeypatch, capsys):
+    """`brolly login` through full dispatch, which is where the contradiction showed: it printed that the token
+    stays on disk and then deleted it anyway. Healing runs first (`corp-legacy` converts, `corp-foreign` cannot),
+    and what the run says about the blob has to match what is on disk when it ends — said once, by the one place
+    that decides."""
+    from brolly import cli
+
+    _write_foreign_credential_process_config(aws_env)
+    keychain._record_secured_session(_SESSION, True)
+    token = _plant_plaintext_token(client_id='client-corp')
+    stale_bytes = token.read_bytes()
+    monkeypatch.setattr(cli, '_require_aws', lambda: None)
+    _stub_secure_login_keychain(monkeypatch, _FakeKeyring())
+    _stub_device_login_transport(monkeypatch)
+
+    cli.main(['login', '-s', _SESSION])
+
+    assert token.read_bytes() == stale_bytes
+    assert 'brolly_sso_account_id' in botocore.session.Session(profile=_STOCK).get_scoped_config()  # healing ran
+    err = capsys.readouterr().err
+    assert err.count(f"session '{_SESSION}' is secured, but ~/.aws/sso/cache still holds") == 1
+    assert _FOREIGN in err
+    assert 'removed plaintext token cache' not in err
 
 
 _SSO_CONFIG_FOR_TOKEN = {'sso_sessions': {_SESSION: _SSO_CONFIG}}
@@ -1689,6 +1983,46 @@ def test_ensure_secure_token_exits_when_still_unresolvable_after_login(aws_env, 
 
     with pytest.raises(SystemExit, match='could not obtain a valid SSO token'):
         keychain._ensure_secure_token(_PROFILE, _SESSION, _SSO_CONFIG_FOR_TOKEN, fake_keyring)
+
+
+def test_ensure_secure_token_leaves_the_blob_a_profile_that_could_not_convert_still_needs(aws_env, monkeypatch, capsys):
+    """The `switch` / `add` route into a device login, driven through the door those commands come in by. Same rule:
+    the token the login puts in the keychain is no licence to delete the blob `corp-foreign` is still resolving
+    from, and the login itself is not where that gets decided."""
+    from brolly import cli
+
+    _write_foreign_credential_process_config(aws_env)
+    token = _plant_plaintext_token(client_id='client-corp')
+    stale_bytes = token.read_bytes()
+    fake_keyring = _FakeKeyring()
+    _stub_secure_login_keychain(monkeypatch, fake_keyring)
+    _stub_device_login_transport(monkeypatch)
+
+    full_config = botocore.session.Session().full_config
+    cli._enter_secure_session(_SESSION, full_config)
+    assert keychain._ensure_secure_token(_STOCK, _SESSION, full_config, fake_keyring) == 'access-tok'
+
+    assert token.read_bytes() == stale_bytes
+    err = capsys.readouterr().err
+    assert f"session '{_SESSION}' is secured" in err and _FOREIGN in err
+    assert 'removed plaintext token cache' not in err
+
+
+def test_ensure_secure_token_route_still_purges_when_nothing_reads_the_cache_any_more(aws_env, monkeypatch, capsys):
+    from brolly import cli
+
+    _write_config(aws_env, secure=True)
+    token = _plant_plaintext_token(client_id='client-corp')
+    fake_keyring = _FakeKeyring()
+    _stub_secure_login_keychain(monkeypatch, fake_keyring)
+    _stub_device_login_transport(monkeypatch)
+
+    full_config = botocore.session.Session().full_config
+    cli._enter_secure_session(_SESSION, full_config)
+    assert keychain._ensure_secure_token(_PROFILE, _SESSION, full_config, fake_keyring) == 'access-tok'
+
+    assert not token.exists()
+    assert f"removed plaintext token cache for session '{_SESSION}'" in capsys.readouterr().err
 
 
 def test_cmd_secure_add_writes_secure_shape_without_activating_sso_credential_provider(aws_env, monkeypatch):

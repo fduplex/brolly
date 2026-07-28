@@ -380,17 +380,6 @@ def _remove_leftovers(session_name: SessionName, leftovers: _Leftovers) -> None:
             )
 
 
-def _purge_plaintext_token(session_name: SessionName, sso_config: AwsConfig) -> None:
-    """Drop everything a secured session left in ~/.aws/sso/cache — its token blob and the client registration
-    `aws sso login` cached beside it.
-
-    Unconditional, and only one caller may be: a completed device login, which has just put a fresh token in the
-    keychain and so has made what it deletes stale by definition. Everything else — `secure enable` included —
-    goes through ``purge_session_plaintext``, which first checks that nothing still resolves out of it.
-    """
-    _remove_leftovers(session_name, _plaintext_leftovers(session_name, sso_config))
-
-
 def _stock_profiles(session_name: SessionName, full_config: AwsConfig) -> list[ProfileName]:
     """Profiles under the session still carrying both stock SSO keys — botocore resolves those from the plaintext
     blob, and they are exactly the set ``_reshape_session_profiles`` converts, so what healing fixes is what this
@@ -435,6 +424,12 @@ def purge_session_plaintext(session_name: SessionName, full_config: AwsConfig | 
     """Clear what a secured session left in ~/.aws/sso/cache — its token blob, and the OIDC client registration
     `aws sso login` cached beside it — whether or not this command authenticated. ``cli`` runs this from the one
     place that decides a session is secure, so no command can forget it.
+
+    Every purge comes through here, a completed device login included. A fresh keychain token makes the blob stale
+    for brolly, but a stock profile cannot read the keychain at all — for that profile the blob is still the only
+    credential there is, and deleting it on the strength of a login it cannot use locks the user out until the next
+    `aws sso login`. So no path may delete these files while any profile under the session still resolves from
+    them, and no path may delete them before healing has had its chance to remove the last such reader.
 
     Two guards, both stated rather than silent, and neither a replacement for the other:
 
@@ -503,11 +498,23 @@ def report_session_plaintext(session_name: SessionName, full_config: AwsConfig) 
     )
 
 
+def _keychain_failures(keyring_module: ModuleType) -> tuple[type[BaseException], ...]:
+    """What "the keychain will not answer" is raised as — which is not one class, whatever `keyring` documents.
+
+    ``KeyringError`` is the contract, and the backends do not all keep it: ``keyring_pass`` raises a bare
+    ``RuntimeError`` when gpg-agent refuses to unlock. That is brolly's own recommendation for a desktop-less Linux
+    box (see ``_NO_KEYRING_BACKEND``) failing in precisely the way `secure disable` exists to get the user out of,
+    so a taxonomy naming only ``KeyringError`` tracebacks on the path that most needs to degrade cleanly. Widened
+    to these two and no further: a locked keychain is a specific condition, not "anything went wrong".
+    """
+    return (keyring_module.errors.KeyringError, RuntimeError)
+
+
 def _keyring_call(keyring_module: ModuleType, operation: Any, *args: str) -> Any:
     """Run a keyring operation, turning any backend failure into a clean exit rather than a traceback."""
     try:
         return operation(*args)
-    except keyring_module.errors.KeyringError as x:
+    except _keychain_failures(keyring_module) as x:
         raise SystemExit(f'OS keychain access failed: {x}') from None
 
 
@@ -527,16 +534,26 @@ def _quiet_stderr() -> Any:
         os.close(saved)
 
 
+def _prove_keychain(keyring_module: ModuleType, session_name: SessionName) -> None:
+    """Do one real keychain operation — a read of the session's own entry, hit or miss — and let its SystemExit out.
+
+    Loading a backend is not the same as being able to use one: a saved backend whose package is gone, or a `pass`
+    store whose gpg-agent cannot unlock headless, only fails on the first real operation. Takes the module rather
+    than resolving one, because ``secure enable`` must prove a backend it has not saved yet — see
+    ``cmd_secure_enable``, which cannot ask ``_configured_keyring`` for the backend it is in the middle of choosing.
+    """
+    with _quiet_stderr():
+        _keyring_call(keyring_module, keyring_module.get_password, _KEYRING_SERVICE, _cache_key(session_name))
+
+
 def preflight_keychain(session_name: SessionName) -> ModuleType:
     """Prove the keychain is reachable *before* a caller mutates anything on the strength of it.
 
-    Loading a backend is not the same as being able to use one: a saved backend whose package is gone, or a `pass`
-    store whose gpg-agent cannot unlock headless, only fails on the first real operation. So this does one — a read
-    of the session's own entry, hit or miss — and lets its SystemExit out while ~/.aws is still untouched.
+    Resolves brolly's saved backend and proves it with ``_prove_keychain``, so the failure of a backend that loads
+    but cannot answer surfaces while ~/.aws is still untouched.
     """
     keyring_module = _configured_keyring()
-    with _quiet_stderr():
-        _keyring_call(keyring_module, keyring_module.get_password, _KEYRING_SERVICE, _cache_key(session_name))
+    _prove_keychain(keyring_module, session_name)
     return keyring_module
 
 
@@ -814,6 +831,12 @@ def _device_login(session_name: SessionName, sso_config: AwsConfig, cache: _Keyc
 
     botocore's token provider only *refreshes* an existing token; it never performs the initial device login, so
     brolly drives the OIDC dance itself. The blob's key set matches exactly what botocore's refresh path reads.
+
+    It stores the token and deletes nothing. Clearing what the session left in ~/.aws/sso/cache belongs to the two
+    places that heal the profiles first and hold the ``full_config`` the decision needs —
+    ``cli._enter_secure_session`` and `secure enable` — and never to this, which runs before either has had its
+    chance. See ``purge_session_plaintext`` for why a fresh keychain token is no licence to delete a stock
+    profile's only credential.
     """
     start_url: str = sso_config['sso_start_url']
     sso_region: Region = sso_config['sso_region']
@@ -870,7 +893,6 @@ def _device_login(session_name: SessionName, sso_config: AwsConfig, cache: _Keyc
         blob['refreshToken'] = token['refreshToken']
     cache[_cache_key(session_name)] = blob
     print('✓ authorized — SSO token stored in your OS keychain', file=sys.stderr)
-    _purge_plaintext_token(session_name, sso_config)
     if 'refreshToken' not in blob:
         print(
             f'! IAM Identity Center issued no refresh token for this session, so it cannot renew silently — '
@@ -970,12 +992,25 @@ def cmd_secure_enable(session_name: SessionName, full_config: AwsConfig, backend
 
     Resolves the keyring backend (explicit ``--backend``, else the saved one, else auto-detect — a real OS keychain
     or a ready pass store) and **persists it** so later ``credential-process`` calls never touch the environment.
+
+    It is persisted only once ``_prove_keychain`` has shown it actually works, which is why that proof is taken here
+    rather than through ``preflight_keychain``: the backend being weighed is not yet the saved one. Saving first
+    would mean a backend that loads and then refuses — a pass store gpg-agent will not unlock, a package that
+    imports but cannot operate — is what ``_configured_keyring`` hands every later command, so one failed `enable`
+    would drag already-working sessions down with it.
     """
     keyring_module = _import_keyring()
     backend = backend or _read_config().get('keyring_backend') or _autodetect_backend(keyring_module)
     if backend is None:
         raise SystemExit(_NO_KEYRING_BACKEND)
     _select_backend(keyring_module, backend)
+    try:
+        _prove_keychain(keyring_module, session_name)
+    except SystemExit as x:
+        raise SystemExit(
+            f"{x}\n  keyring backend '{backend}' loaded but could not be used, so it was not saved and nothing "
+            f'about this session was changed.'
+        ) from None
     _write_config({**_read_config(), 'keyring_backend': backend})
     print(f'→ keychain backend: {_backend_label(keyring_module)}  (saved to {_config_path()})', file=sys.stderr)
     sso_config = full_config['sso_sessions'][session_name]
@@ -1027,22 +1062,74 @@ def cmd_secure_enable(session_name: SessionName, full_config: AwsConfig, backend
 def _delete_keychain_token(session_name: SessionName) -> None:
     """Drop the session's keychain entry (and its sidecar), reporting rather than raising if the backend refuses.
 
-    Only `secure disable` calls this, and by then the profiles are already back to stock: an unreachable keychain
+    Only `secure disable` calls this, and by then every profile is already back to stock: an unreachable keychain
     must not turn a completed revert into a failed command. What it leaves behind is inert — nothing reads that
     entry once the session is no longer secured — so a named warning is the whole remedy.
+
+    ``RuntimeError`` is caught alongside the ``SystemExit`` ``_keyring_call`` raises because resolving the backend
+    is itself a keychain call, made before any ``_keyring_call`` wraps anything — see ``_keychain_failures`` for
+    which backend raises what.
     """
     cache_key = _cache_key(session_name)
     try:
         cache = _KeychainTokenCache(_configured_keyring(), session_name)
         with suppress(KeyError):
             del cache[cache_key]
-    except SystemExit as x:
+    except (SystemExit, RuntimeError) as x:
         print(
             f"! the OS keychain entry for session '{session_name}' could not be removed: {x}\n"
             f'  Nothing reads it now, but delete it yourself if you would rather it were gone.',
             file=sys.stderr,
         )
         _remove_sidecar(cache_key)
+
+
+_SECURE_KEYS = {'credential_process', 'brolly_sso_account_id', 'brolly_sso_role_name'}
+
+# What botocore has to read back before a profile counts as reverted: the pair its SSO credential provider
+# activates on, and the session the token provider resolves that against. Two of the three without the third
+# resolves nothing at all.
+_STOCK_KEYS = ('sso_account_id', 'sso_role_name', 'sso_session')
+
+
+def _revert_profile(profile: ProfileName, account_id: AccountId, role: RoleName) -> bool:
+    """Write one secured profile back to stock shape, proving each half landed before the next is allowed to run.
+
+    Returns whether botocore now reads this profile as a working stock SSO profile. The read-back is the same
+    discipline ``_secure_profile`` applies in the other direction, and for the same reason — `aws configure set`
+    matches section headers more strictly than botocore parses them, so an unusual header (``[profile  x]`` with
+    two spaces, a quoted name, a trailing comment) makes it append a *second* section that shadows the first, and
+    botocore then reads the profile as that section alone.
+
+    What differs is the order: nothing is removed until the stock keys are proven present. A revert that lands in a
+    shadowing section has already cost the profile its ``sso_session`` and its ``credential_process``; stripping
+    the secure keys on top of that would leave nothing on disk to merge the two sections back from. So on a failed
+    read-back the profile keeps every key it had, and the caller keeps the keychain token those keys resolve by.
+    """
+    _aws('configure', 'set', 'sso_account_id', account_id, '--profile', profile)
+    _aws('configure', 'set', 'sso_role_name', role, '--profile', profile)
+    if missing := [key for key in _STOCK_KEYS if not _profile_on_disk(profile).get(key)]:
+        print(
+            f"! '{profile}' is not back in stock shape after the revert — read back from {_aws_config_path()} it is "
+            f'missing {", ".join(missing)}, so brolly removed none of its secure keys.\n'
+            f'  `aws configure set` matches section headers more strictly than botocore reads them, so an unusual '
+            f'header (a trailing comment, a quoted or oddly spaced name) makes it write a second [profile '
+            f'{profile}] section that shadows the first — which is where the two lines it just wrote went. Merge '
+            f'the two sections by hand, then re-run the command.',
+            file=sys.stderr,
+        )
+        return False
+    _config_remove_keys(profile, _SECURE_KEYS)
+    if left := sorted(_SECURE_KEYS & _profile_on_disk(profile).keys()):
+        print(
+            f"! '{profile}' still carries {', '.join(left)} in {_aws_config_path()} after brolly tried to remove "
+            f'them, so it is not back in stock shape — credential_process still points at a brolly that no longer '
+            f'holds its token.\n'
+            f'  Delete those lines from its section by hand, then re-run the command.',
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def cmd_secure_disable(session_name: SessionName, full_config: AwsConfig) -> None:
@@ -1054,8 +1141,19 @@ def cmd_secure_disable(session_name: SessionName, full_config: AwsConfig) -> Non
     deletion is a separate step allowed to fail. The record is dropped before that step for the same reason: a
     session whose profiles are back to stock while brolly still calls it secured would be silently re-secured by
     the next command.
+
+    Both of those last two steps are conditional on every revert having landed, which is the one thing this command
+    may not take on trust. A revert is a write to ~/.aws/config, and a write that misses its section (see
+    ``_revert_profile``) leaves a profile resolving neither through the keychain nor through the plaintext cache —
+    so deleting the token and dropping the record behind it would hand the user no credentials at all under a line
+    saying secure mode was turned off. Profiles that did revert are left reverted, because re-securing them would
+    be inventing a second failure; what a failure holds back is the keychain token, the record, and the ✓.
+
+    Only the read-back moved into the revert loop, not the keychain: it is a file read, so an unreachable keychain
+    still gets every profile it can back to stock before anything asks the keyring for anything.
     """
-    reverted = 0
+    reverted: list[ProfileName] = []
+    failed: list[ProfileName] = []
     for profile, cfg in _session_profiles(session_name, full_config):
         if not _is_secure(cfg):
             continue
@@ -1063,22 +1161,33 @@ def cmd_secure_disable(session_name: SessionName, full_config: AwsConfig) -> Non
         # keys still in place — reverting to those is exactly right, and beats a KeyError traceback
         account_id = cfg.get('brolly_sso_account_id') or cfg.get('sso_account_id')
         role = cfg.get('brolly_sso_role_name') or cfg.get('sso_role_name')
-        if account_id and role:
-            _aws('configure', 'set', 'sso_account_id', account_id, '--profile', profile)
-            _aws('configure', 'set', 'sso_role_name', role, '--profile', profile)
-            reverted += 1
-        else:
+        if not (account_id and role):
             print(
                 f"! '{profile}' has no role recorded under either brolly_sso_role_name or sso_role_name, so there "
                 f'is nothing to revert it to — its brolly keys are removed, leaving it for '
                 f'`AWS_PROFILE={profile} brolly switch` to finish.',
                 file=sys.stderr,
             )
-        _config_remove_keys(profile, {'credential_process', 'brolly_sso_account_id', 'brolly_sso_role_name'})
+            # nothing this profile can resolve by is being taken away: it had no account/role either way, so it is
+            # not a revert that failed and it does not hold the token back
+            _config_remove_keys(profile, _SECURE_KEYS)
+            continue
+        (reverted if _revert_profile(profile, account_id, role) else failed).append(profile)
+
+    if failed:
+        print(
+            f"! secure mode is still on for session '{session_name}' — {', '.join(failed)} could not be reverted, "
+            f"so brolly kept its keychain token and the session's secured record rather than delete the credentials "
+            f'a half-reverted profile is fixed back into.\n'
+            f'  {len(reverted)} profile(s) did revert and read from the stock cache now'
+            + (f': {", ".join(reverted)}' if reverted else '')
+            + f'\n  Fix the profile(s) named above, then re-run:  brolly secure disable -s {session_name}'
+        )
+        raise SystemExit(1)
 
     _record_secured_session(session_name, False)
     _delete_keychain_token(session_name)
-    print(f"✓ secure mode off for session '{session_name}' — {reverted} profile(s) back to the stock cache")
+    print(f"✓ secure mode off for session '{session_name}' — {len(reverted)} profile(s) back to the stock cache")
 
 
 def cmd_secure_login(session_name: SessionName, full_config: AwsConfig) -> None:
