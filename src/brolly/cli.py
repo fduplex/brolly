@@ -12,9 +12,13 @@ usage:
                                      create a new profile under an existing sso-session, pick its account/role,
                                      and leave it authenticated
   brolly ls [--no-check]             list every sso-session and its profiles, with token status; by default
-                                     silently probes each session over the network to distinguish a dead 7-day
-                                     session from a merely-lapsed hourly token — --no-check skips that and reads
+                                     silently probes each session over the network to distinguish a dead SSO
+                                     session from a merely-lapsed access token — --no-check skips that and reads
                                      local expiry files only
+
+The expiry `ls` shows is the SSO *access token*'s (8h from a fresh login, an hour per silent renewal), never the
+access-portal session's — that one lives only server-side, so each session line also notes whether it can renew
+without a browser at all.
 
 Bare `brolly` no longer force-logs-in — it refreshes the current profile; use `brolly login` for a forced login.
 
@@ -25,6 +29,10 @@ crossing sessions is always deliberate.
 $AWS_PROFILE is never modified — it is the fixed handle; `switch` only changes what it resolves to, `add`
 creates a new profile without changing which one the shell uses, and `refresh` targets the aws CLI with
 --profile rather than touching the ambient env.
+
+Secure mode is a property of the sso-session, not of a profile: once `brolly secure enable -s <session>` has run,
+every command above takes the keychain path for that session — `login` authorizes into the keychain instead of
+~/.aws/sso/cache, `add` creates the profile already secured — and `secure` itself only has enable/disable.
 """
 
 import argparse
@@ -33,11 +41,13 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import termios
 import tty
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Any, NamedTuple
 
 import boto3
 import botocore.session
@@ -59,6 +69,7 @@ type RoleName = str
 type AccessToken = str
 type AwsConfig = dict[str, Any]  # botocore's full_config / scoped-config nested-dict shape
 type Account = dict[str, str]  # a boto3 sso.list_accounts entry: accountId, accountName, emailAddress
+type ProfileRow = tuple[ProfileName, list[str], bool]  # (profile, cells in _HEADERS order, is-secure)
 
 _ORANGE = '\033[38;5;214m'
 _DIM = '\033[2m'
@@ -83,10 +94,14 @@ _GREEN = '\033[32m'
 _RED = '\033[31m'
 
 # `ls` status -> (colour, glyph); palette kept in step with the ps1 pill's live/idle/gone/plain states so the
-# two surfaces read as one tool.
+# two surfaces read as one tool. `stock` is `ls`'s own fifth state and has no pill counterpart: the pill reads one
+# profile's store, while this is a fact about a whole session mid-migration (see `_awaiting_migration`). It takes
+# the orange every other "works, but wants attention" state here takes, and the lock glyph because the session
+# really is secured \u2014 it is only its token that has not moved yet.
 _STATUS_STYLES: dict[State, tuple[str, str]] = {
     'live': (_GREEN, _CHECK),
     'idle': (_ORANGE, _CLOCK),
+    'stock': (_ORANGE, _LOCK),
     'gone': (_RED, _CROSS),
     'plain': (_DIM, '\u00b7'),
 }
@@ -109,6 +124,118 @@ _SESSION_INDENT = 3  # left margin the whole table (headings, rule, session and 
 # widest of `<glyph> <state word>` across every state, floored at the heading label — the status column never
 # depends on the data, so it is sized once here
 _STATUS_WIDTH = max(len(_STATUS_HEADING), *(len(f'{glyph} {state}') for state, (_, glyph) in _STATUS_STYLES.items()))
+
+_SECURED_SESSIONS = 'secured_sessions'  # key in brolly's own config holding the sorted list of secured sessions
+
+
+def _aws_dir() -> Path:
+    """The ``.aws`` directory, honoring ``AWS_CONFIG_FILE`` so tests and non-standard layouts resolve correctly."""
+    cfg = os.environ.get('AWS_CONFIG_FILE')
+    return Path(cfg).parent if cfg else Path.home() / '.aws'
+
+
+# brolly's own directory and the files in it. Nothing they hold is secret — a session name, an ISO expiry, a
+# boolean, a keyring backend path — so this is not protecting a credential. It is refusing to be the loose file in
+# the room: brolly's whole point next door is that ~/.aws/sso/cache is a 0600 file botocore keeps private, and a
+# 0755 directory of 0644 files sitting beside it is a downgrade nobody chose. Files brolly does not own —
+# ~/.aws/config above all, which is the AWS CLI's — keep whatever mode the user gave them.
+_BROLLY_DIR_MODE = 0o700
+_BROLLY_FILE_MODE = 0o600
+
+
+def _brolly_dir() -> Path:
+    """brolly's own directory: its config and the expiry sidecars, under ``<aws-config-dir>/brolly/``."""
+    return _aws_dir() / 'brolly'
+
+
+def _ensure_brolly_dir() -> Path:
+    """Create brolly's own directory, and tighten one an earlier brolly (or a loose umask) left group-readable."""
+    path = _brolly_dir()
+    path.mkdir(parents=True, exist_ok=True, mode=_BROLLY_DIR_MODE)
+    path.chmod(_BROLLY_DIR_MODE)
+    return path
+
+
+def _config_path() -> Path:
+    """brolly's own config, co-located with the expiry sidecars under ``<aws-config-dir>/brolly/``."""
+    return _brolly_dir() / 'config.json'
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Replace a file's contents in one step — an interrupted write leaves the old file, never a truncated one.
+
+    The temp file is created in the target's own directory so ``os.replace`` is a rename within one filesystem, and
+    the mode it lands on follows who owns the file. One of brolly's own ends up at ``_BROLLY_FILE_MODE`` however
+    loose it was before, which is how a file an older brolly wrote 0644 gets tightened rather than preserved;
+    anything else keeps its existing mode, so rewriting ~/.aws/config never narrows it to the temp file's 0600.
+    """
+    fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f'.{path.name}.', suffix='.tmp')
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(text)
+        if path.parent == _brolly_dir():
+            temp.chmod(_BROLLY_FILE_MODE)  # what mkstemp already gives it, stated rather than relied on
+        elif path.exists():
+            shutil.copymode(path, temp)
+        os.replace(temp, path)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+
+
+def _read_config() -> dict[str, Any]:
+    """brolly's own config. Absent is legitimately empty; present-but-unreadable is not, and must not read as one.
+
+    This file is the authoritative record of which sessions are secured. Treating a corrupt or unreadable one as
+    "nothing is secured" would send a secured session down the plaintext path, whose `login` writes a fresh refresh
+    token into ~/.aws/sso/cache — the leak the record exists to close. So it fails loudly instead.
+    """
+    path = _config_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as x:
+        raise SystemExit(
+            f'{path} is unreadable ({x}), so brolly cannot tell which sso-sessions are secured and will not '
+            f'guess.\n  Repair it, or delete it and re-run:  brolly secure enable -s <session>'
+        ) from None
+    if not isinstance(data, dict):
+        raise SystemExit(f'{path} does not contain a JSON object — repair or delete it')
+    return data
+
+
+def _write_config(data: dict[str, Any]) -> None:
+    _ensure_brolly_dir()
+    _atomic_write(_config_path(), json.dumps(data, indent=2) + '\n')
+
+
+def _secured_sessions() -> set[SessionName]:
+    recorded = _read_config().get(_SECURED_SESSIONS)
+    return {s for s in recorded if isinstance(s, str)} if isinstance(recorded, list) else set()
+
+
+def _record_secured_session(session_name: SessionName, secured: bool) -> None:
+    """Add or drop the session in brolly's own record of which sessions are secured.
+
+    The record is what makes secure-ness detectable when *no* profile carries the secure shape — a session whose
+    profiles are all skeletons, or which has none at all. Its token is in the keychain either way, and without this
+    the session would read as plaintext and the next `login` would write a fresh refresh token back to disk. A
+    record brolly cannot write is therefore not a nicety to swallow: it is the difference between the two modes.
+    """
+    sessions = _secured_sessions()
+    updated = sessions | {session_name} if secured else sessions - {session_name}
+    if updated == sessions:
+        return
+    try:
+        _write_config({**_read_config(), _SECURED_SESSIONS: sorted(updated)})
+    except OSError as x:
+        state = 'secured' if secured else 'no longer secured'
+        raise SystemExit(
+            f"brolly could not record session '{session_name}' as {state} in {_config_path()}: {x}\n"
+            f'  Until that file is writable, brolly cannot be trusted to route this session to the OS keychain.'
+        ) from None
 
 
 def _require_aws() -> None:
@@ -141,7 +268,7 @@ def _profile_sso(profile: ProfileName) -> tuple[SessionName, Region, AccountId |
 
 
 def _resolve_token(profile: ProfileName) -> AccessToken | None:
-    """A valid SSO access token — refreshed if the hourly one lapsed; None if the 7-day session is dead."""
+    """A valid SSO access token — refreshed if the cached one lapsed; None if the SSO session itself is dead."""
     resolver = create_token_resolver(botocore.session.Session(profile=profile))
     try:
         token = resolver.load_token()
@@ -154,7 +281,7 @@ def _ensure_token(profile: ProfileName, session_name: SessionName) -> AccessToke
     token = _resolve_token(profile)
     if token is not None:
         return token
-    # session fully expired (>7d): the refresh token is dead, so log in interactively, then resolve again
+    # the access-portal session itself has ended, so the refresh token is dead: log in interactively and re-resolve
     print(f"SSO session '{session_name}' expired — logging in…", file=sys.stderr)
     _aws('sso', 'login', '--sso-session', session_name, '--no-browser', '--use-device-code', capture=False)
     token = _resolve_token(profile)
@@ -286,27 +413,43 @@ def cmd_switch(profile: ProfileName) -> None:
     print(f'\n{_ORANGE}{_CHECK}{_RESET}  {profile} → {account_id} ({account["accountName"]}) / {role}')
 
 
-def cmd_add(session: SessionName, new_profile: ProfileName, full_config: AwsConfig) -> None:
-    sso_sessions = full_config['sso_sessions']
-    profiles = full_config['profiles']
-
-    if session not in sso_sessions:
-        raise SystemExit(f"unknown sso-session '{session}' — available: {', '.join(sorted(sso_sessions))}")
-    if new_profile in profiles:
+def _require_new_profile(new_profile: ProfileName, full_config: AwsConfig) -> None:
+    """Exit if `add`'s target name is taken — checked at dispatch too, before the secure door mutates anything."""
+    if new_profile in full_config['profiles']:
         raise SystemExit(f"profile '{new_profile}' already exists — use `brolly switch` to repoint it")
 
-    sso_region: Region = sso_sessions[session]['sso_region']
+
+def _create_profile_skeleton(session: SessionName, new_profile: ProfileName, full_config: AwsConfig) -> Region:
+    """Write the session/region/output of a new profile, mirroring a sibling under the same session.
+
+    The part of `add` that is identical either side of secure mode — what follows it (standard ``sso_*`` keys vs
+    ``credential_process`` + ``brolly_sso_*``) is what differs. Returns the session's sso-region.
+    """
+    profiles = full_config['profiles']
+    _require_known_session(session, full_config)
+    _require_new_profile(new_profile, full_config)
+
+    sso_region: Region = full_config['sso_sessions'][session]['sso_region']
     sibling = next((p for p in profiles.values() if p.get('sso_session') == session), {})
     _aws('configure', 'set', 'sso_session', session, '--profile', new_profile)
     _aws('configure', 'set', 'region', sibling.get('region', sso_region), '--profile', new_profile)
     _aws('configure', 'set', 'output', sibling.get('output', 'json'), '--profile', new_profile)
+    return sso_region
 
+
+def _report_added(new_profile: ProfileName, account: Account, role: RoleName) -> None:
+    print(
+        f'\n{_ORANGE}{_CHECK}{_RESET}  added {new_profile} → {account["accountId"]} ({account["accountName"]}) / {role}'
+    )
+    print(f'{_DIM}  use it: export AWS_PROFILE={new_profile}{_RESET}')
+
+
+def cmd_add(session: SessionName, new_profile: ProfileName, full_config: AwsConfig) -> None:
+    sso_region = _create_profile_skeleton(session, new_profile, full_config)
     token = _ensure_token(new_profile, session)
     account, role = _pick_account_role(sso_region, token)
-    account_id = account['accountId']
     _write_account_role(new_profile, account, role)
-    print(f'\n{_ORANGE}{_CHECK}{_RESET}  added {new_profile} → {account_id} ({account["accountName"]}) / {role}')
-    print(f'{_DIM}  use it: export AWS_PROFILE={new_profile}{_RESET}')
+    _report_added(new_profile, account, role)
 
 
 def _backfill_account_name(profile: ProfileName, sso_region: Region, account_id: AccountId | None) -> None:
@@ -330,9 +473,41 @@ def _is_secure(profile_config: AwsConfig) -> bool:
     return 'brolly_sso_account_id' in profile_config
 
 
+def _session_is_secure(session_name: SessionName, full_config: AwsConfig) -> bool:
+    """True if the session is in secure mode — the one switch every command dispatches on. Pure: never writes.
+
+    Secure-ness belongs to the session, not the profile: the token is stored per-session in the keychain. brolly's
+    own record of secured sessions is therefore the authoritative answer, and the only one that survives a session
+    having no secure-shaped profile to read it off. The profile scan behind it is a fallback for sessions secured
+    by an older brolly, which wrote no record; it also self-heals a session whose profiles have drifted apart — a
+    profile added after `secure enable` ran still takes the secure paths, and `add`/`switch` write it secure.
+    """
+    if session_name in _secured_sessions():
+        return True
+    return any(_is_secure(c) for _, c in _session_profiles(session_name, full_config))
+
+
+def _enter_secure_session(session_name: SessionName, full_config: AwsConfig) -> ModuleType:
+    """The single door into the keychain paths — returns the keychain module, having run what every secure
+    command owes the session first: prove the keychain is reachable, back-fill the secured-session record (for one
+    secured by an older brolly), heal any profile left in stock shape, then clear the plaintext token that healing
+    made redundant. None of the four may wait for a command that actually authenticates, and the order is
+    load-bearing — the preflight comes first because everything after it rewrites ~/.aws or deletes a token on the
+    strength of a keychain that must therefore be known to work, and healing is what removes the last reader of
+    the blob, so the purge after it needs no exception.
+    """
+    from brolly import keychain
+
+    keychain.preflight_keychain(session_name)
+    _record_secured_session(session_name, True)
+    keychain.heal_session_profiles(session_name, full_config)
+    keychain.purge_session_plaintext(session_name, full_config)
+    return keychain
+
+
 def _secure_mode_tip(session_name: SessionName, full_config: AwsConfig) -> None:
     """A dim, one-line nudge toward secure mode after a credential-establishing action — unless already secured."""
-    if any(_is_secure(c) for c in full_config['profiles'].values() if c.get('sso_session') == session_name):
+    if _session_is_secure(session_name, full_config):
         return
     print(
         f"{_DIM}tip: 'brolly secure enable -s {session_name}' keeps this session's token in your OS keychain, "
@@ -341,9 +516,26 @@ def _secure_mode_tip(session_name: SessionName, full_config: AwsConfig) -> None:
     )
 
 
-def cmd_refresh(
-    target_profile: ProfileName, session: SessionName, full_config: AwsConfig, secure: bool = False
-) -> None:
+def _unsecured_profile_error(profile: ProfileName, session: SessionName) -> str:
+    """Why a profile that is not in secure shape under a secured session resolves nothing, and what fixes it.
+
+    Dispatch heals every stock profile before the command runs, and a profile healing could not convert keeps its
+    secure keys (so it never reaches this), leaving one live case: a profile with no account/role to move, which
+    only picking one can finish.
+    """
+    return (
+        f"profile '{profile}' has no account/role set, so nothing can resolve credentials for it.\n"
+        f'  Finish it:  AWS_PROFILE={profile} brolly switch  '
+        f"— under the secured session '{session}' it will be written in secure shape"
+    )
+
+
+def _require_profile_in_session(target_profile: ProfileName, session: SessionName, full_config: AwsConfig) -> None:
+    """Exit unless the profile exists, is an SSO profile, and belongs to the asserted session. Pure: never writes.
+
+    Dispatch runs this *before* it opens the secure door, so a mistyped `-s` fails without having first healed and
+    purged the session it named.
+    """
     profiles = full_config['profiles']
     if target_profile not in profiles:
         raise SystemExit(f"unknown profile '{target_profile}' — available: {', '.join(sorted(profiles))}")
@@ -356,7 +548,15 @@ def cmd_refresh(
         )
     if actual not in full_config['sso_sessions']:
         raise SystemExit(f"sso-session '{actual}' referenced by '{target_profile}' is not defined")
-    sso_region: Region = full_config['sso_sessions'][actual]['sso_region']
+
+
+def cmd_refresh(
+    target_profile: ProfileName, session: SessionName, full_config: AwsConfig, secure: bool = False
+) -> None:
+    """Verify the profile's credentials, re-logging in only if they are gone — `secure` is the session's mode."""
+    _require_profile_in_session(target_profile, session, full_config)
+    profiles = full_config['profiles']
+    sso_region: Region = full_config['sso_sessions'][session]['sso_region']
     account_id: AccountId | None = profiles[target_profile].get('sso_account_id')
     check = subprocess.run(
         ['aws', 'sts', 'get-caller-identity', '--profile', target_profile, '--query', 'Arn', '--output', 'text'],
@@ -364,13 +564,16 @@ def cmd_refresh(
         capture_output=True,
     )
     if check.returncode != 0:
+        if secure and not _is_secure(profiles[target_profile]):
+            # no amount of logging in fixes a profile that resolves nowhere, so say what is actually wrong
+            raise SystemExit(_unsecured_profile_error(target_profile, session))
         print(f'{target_profile}: credentials unavailable — logging in…', file=sys.stderr)
         if secure:
             from brolly import keychain
 
-            keychain.cmd_secure_login(actual, full_config)
+            keychain.cmd_secure_login(session, full_config)
         else:
-            _aws('sso', 'login', '--sso-session', actual, '--no-browser', '--use-device-code', capture=False)
+            cmd_login(session)
         arn = _aws(
             'sts', 'get-caller-identity', '--profile', target_profile, '--query', 'Arn', '--output', 'text'
         ).stdout.strip()
@@ -396,6 +599,34 @@ def _read_expiry(path: Path) -> datetime | None:
     return expiry if expiry.tzinfo else expiry.replace(tzinfo=UTC)
 
 
+def _read_refreshable(path: Path, secure: bool) -> bool | None:
+    """Whether this session can get a new access token without a browser. None when the store can't say.
+
+    The two stores answer differently: botocore's plaintext cache holds the refresh token itself, so its presence
+    is the answer. A secure-mode sidecar is non-secret by design and instead records the flag brolly wrote beside
+    the expiry — absent on sidecars written before that flag existed, hence the third state.
+    """
+    try:
+        blob = json.loads(path.read_text())
+    except OSError, ValueError:
+        return None
+    if not secure:
+        return 'refreshToken' in blob
+    refreshable = blob.get('refreshable')
+    return refreshable if isinstance(refreshable, bool) else None
+
+
+def _renewal_note(state: State, refreshable: bool | None) -> tuple[str, str] | None:
+    """The (text, colour) trailing the expiry, saying whether this session renews itself or ends in a browser.
+
+    Only meaningful while a token exists — 'gone' already reports the absence, and an unknown flag stays silent
+    rather than guessing.
+    """
+    if state == 'gone' or refreshable is None:
+        return None
+    return ('auto-renews', _DIM) if refreshable else ('no refresh token — re-login at expiry', _ORANGE)
+
+
 def _countdown(expiry: datetime) -> str:
     total = int((expiry - datetime.now(UTC)).total_seconds())
     sign, total = ('-', -total) if total < 0 else ('', total)
@@ -407,6 +638,8 @@ def _status_detail(state: State, expiry: datetime | None) -> str:
     """The expiry colspan only — the state word itself now lives in the `status` column, so it is not repeated here."""
     if state == 'gone':
         return 'no valid token'
+    if state == 'stock':
+        return 'secured, not migrated yet — its profiles still resolve from the plaintext token'
     if expiry is None:
         return ''
     verb = 'expires' if expiry > datetime.now(UTC) else 'expired'
@@ -442,7 +675,38 @@ def _probe_session(
         return None
 
 
-def _profile_cells(profile: ProfileName, cfg: AwsConfig, sso_region: Region) -> tuple[ProfileName, list[str], bool]:
+def _awaiting_migration(session_name: SessionName, full_config: AwsConfig, leftovers: Any, keychain_mod: Any) -> bool:
+    """True when a secured session's credentials have simply not moved yet — the state `ls` must not call 'gone'.
+
+    Nothing in the keychain and no sidecar reads as 'gone' locally, and that is the truth only once the session has
+    actually migrated. While its profiles still carry the stock ``sso_account_id``/``sso_role_name`` pair *and* its
+    token blob is still in ~/.aws/sso/cache, those profiles are resolving credentials out of it perfectly well —
+    the session is secured, but nothing has moved. `ls` is the one command that never heals, so it is the one most
+    likely to be run in exactly this state, and 'no valid token' is the opposite of what is true.
+
+    Both halves are required. Stock profiles with no blob resolve nothing, and a migrated session whose blob merely
+    lingers is genuinely gone: neither is a migration waiting to finish, and both really are 'gone'.
+    """
+    if keychain_mod is None or leftovers is None or leftovers.token is None:
+        return False
+    return bool(keychain_mod._stock_profiles(session_name, full_config))
+
+
+class _Block(NamedTuple):
+    """One session's resolved `ls` state — everything the table needs about it, sized and printed in one pass."""
+
+    session: SessionName
+    state: State
+    expiry: datetime | None
+    refreshable: bool | None
+    # secured, yet ~/.aws/sso/cache still holds something of this session's: how to name it, or None when it holds
+    # nothing. A phrase rather than a flag because a leftover is not always a token — an orphaned OIDC client
+    # registration is a client secret with its own ~90-day life, and calling it a token sends the reader elsewhere.
+    leaked: str | None
+    rows: list[ProfileRow]
+
+
+def _profile_cells(profile: ProfileName, cfg: AwsConfig, sso_region: Region) -> ProfileRow:
     """Raw (uncoloured) table cells for one profile row, plus whether it is secure — column order is _HEADERS."""
     account_id = cfg.get('sso_account_id') or cfg.get('brolly_sso_account_id') or '?'
     role = cfg.get('sso_role_name') or cfg.get('brolly_sso_role_name') or '?'
@@ -454,7 +718,7 @@ def _profile_cells(profile: ProfileName, cfg: AwsConfig, sso_region: Region) -> 
 
 
 def _print_profiles(
-    rows: list[tuple[ProfileName, list[str], bool]],
+    rows: list[ProfileRow],
     current: ProfileName | None,
     widths: list[int],
     profile_col: int,
@@ -483,7 +747,7 @@ def _print_profiles(
 
 def _print_ls_footer(
     current: ProfileName | None,
-    blocks: list[tuple[SessionName, State, datetime | None, list[tuple[ProfileName, list[str], bool]]]],
+    blocks: list[_Block],
     full_config: AwsConfig,
     tty: bool,
 ) -> None:
@@ -493,7 +757,7 @@ def _print_ls_footer(
         hint = '(export AWS_PROFILE=<profile> to pick one)'
         print(f'{indent}{_color("AWS_PROFILE not set", _DIM, tty)}  {_color(hint, _DIM, tty)}')
         return
-    found = next(((st, cells) for _, st, _, rows in blocks for prof, cells, _ in rows if prof == current), None)
+    found = next(((b.state, cells) for b in blocks for prof, cells, _ in b.rows if prof == current), None)
     if found is None:
         # set to a profile the table doesn't list: either absent from config, or present but non-SSO (ls lists
         # sso-sessions only) — no session state to show either way, so warn rather than fabricate a status
@@ -518,37 +782,55 @@ def cmd_ls(full_config: AwsConfig, current: ProfileName | None, check: bool) -> 
         raise SystemExit('no sso-sessions configured — create one with `aws configure sso`')
     tty = sys.stdout.isatty()
     config = _aws_config_path()
+    secured = {s for s in sso_sessions if _session_is_secure(s, full_config)}
 
     keychain_mod = keyring_module = None
-    if check and any(_is_secure(c) for c in full_config['profiles'].values()):
+    if secured:
+        # Two read-only things `ls` wants from the keychain module: what a secured session has left in
+        # ~/.aws/sso/cache (always), and a backend to probe it with (under --check). Neither may bring `ls` down,
+        # and a backend that will not resolve still leaves the module itself perfectly able to answer the first.
         try:
             from brolly import keychain
 
-            keychain_mod, keyring_module = keychain, keychain._configured_keyring()
+            keychain_mod = keychain
+            keyring_module = keychain._configured_keyring() if check else None
         except Exception, SystemExit:
-            keychain_mod = keyring_module = None
+            keyring_module = None
 
     # First pass: resolve every session's status and its profile rows so the profile columns can be sized once
     # across all sessions — the table stays aligned across session breaks instead of per-session.
-    blocks: list[tuple[SessionName, State, datetime | None, list[tuple[ProfileName, list[str], bool]]]] = []
+    blocks: list[_Block] = []
     for session_name in sorted(sso_sessions):
         members = _session_profiles(session_name, full_config)
-        secure = any(_is_secure(c) for _, c in members)
+        secure = session_name in secured
         sso_region: Region = sso_sessions[session_name].get('sso_region', '')
         path = _expiry_path(session_name, config, secure)
+        # `ls` reports; it never mutates. Whatever a secured session has left in ~/.aws/sso/cache is stated here and
+        # cleared by the commands that do act — through the same attribution they purge by, so `ls` never names a
+        # file they would not touch, and never a stranger's client registration as this session's.
+        leftovers = (
+            keychain_mod._plaintext_leftovers(session_name, sso_sessions[session_name])
+            if secure and keychain_mod is not None
+            else None
+        )
+        leaked = leftovers.phrase if leftovers is not None and leftovers.paths else None
         state, expiry = _state_for(path), _read_expiry(path)
+        if state == 'gone' and _awaiting_migration(session_name, full_config, leftovers, keychain_mod):
+            state = 'stock'
         if check and state == 'idle' and members:
             probed = _probe_session(session_name, members[0][0], secure, keychain_mod, keyring_module)
             if probed is not None:
                 state, expiry = probed
+        # read after any probe: a successful refresh rewrites the store, so this sees the post-refresh truth
+        refreshable = _read_refreshable(path, secure)
         rows = [_profile_cells(p, c, sso_region) for p, c in sorted(members)]
-        blocks.append((session_name, state, expiry, rows))
+        blocks.append(_Block(session_name, state, expiry, refreshable, leaked, rows))
 
-    all_rows = [cells for _, _, _, rows in blocks for _, cells, _ in rows]
+    all_rows = [cells for b in blocks for _, cells, _ in b.rows]
     # each column is sized to the wider of its widest data cell and its heading label (glyph+word can be widest)
     data_widths = (max((len(cells[c]) for cells in all_rows), default=0) for c in range(len(_HEADERS)))
     widths = [max(w, len(_HEADERS[c])) for c, w in enumerate(data_widths)]
-    session_width = max(len(_SESSION_HEADING), *(len(name) for name, *_ in blocks))
+    session_width = max(len(_SESSION_HEADING), *(len(b.session) for b in blocks))
     # the profile column sits right of the two session-line fields (session name, status), each with a 2-space gap
     profile_col = _SESSION_INDENT + session_width + 2 + _STATUS_WIDTH + 2
 
@@ -559,18 +841,29 @@ def cmd_ls(full_config: AwsConfig, current: ProfileName | None, check: bool) -> 
     print(_color(f'{" " * _SESSION_INDENT}{head_line}', _DIM, tty))  # every heading centred over its column
     # a dim rule spans the table, from the left indent to the region column's right edge (the header line's width)
     print(_color(f'{" " * _SESSION_INDENT}{"─" * len(head_line)}', _DIM, tty))
-    for session_name, state, expiry, rows in blocks:
-        colour, glyph = _STATUS_STYLES[state]
-        status_raw = f'{glyph} {state}'
+    for block in blocks:
+        colour, glyph = _STATUS_STYLES[block.state]
+        status_raw = f'{glyph} {block.state}'
         # name/status cells padded on raw length (ANSI excluded); the expiry detail is a colspan from profile_col
-        name_cell = _color(session_name, _ORANGE, tty) + ' ' * (session_width - len(session_name))
+        name_cell = _color(block.session, _ORANGE, tty) + ' ' * (session_width - len(block.session))
         status_cell = _color(status_raw, colour, tty) + ' ' * (_STATUS_WIDTH - len(status_raw))
-        detail = _status_detail(state, expiry)
+        detail = _status_detail(block.state, block.expiry)
         line = f'{" " * _SESSION_INDENT}{name_cell}  {status_cell}'
         if detail:
             line += f'  {_color(detail, colour, tty)}'
+        # the renewal note carries its own colour — a warning has to read as one even on a green 'live' row
+        note = _renewal_note(block.state, block.refreshable)
+        if note and detail:
+            text, note_colour = note
+            line += _color(f' · {text}', note_colour, tty)
         print(line)
-        _print_profiles(rows, current, widths, profile_col, tty)
+        if block.leaked:
+            warning = (
+                f'! ~/.aws/sso/cache still holds {block.leaked} — the next brolly command using this session '
+                f'clears it, or `brolly secure enable -s {block.session}` now'
+            )
+            print(f'{" " * profile_col}{_color(warning, _ORANGE, tty)}')
+        _print_profiles(block.rows, current, widths, profile_col, tty)
         print()  # blank row after each session group, including the last
     _print_ls_footer(current, blocks, full_config, tty)
     print()  # one final blank line so the footer breathes before the shell prompt returns
@@ -607,12 +900,13 @@ def _build_parser() -> argparse.ArgumentParser:
         '--no-check', dest='check', action='store_false', help='skip the network probe; classify from local cache only'
     )
 
+    # `secure` only turns the mode on and off — every other command reads the mode and routes itself, so there is
+    # no secure-flavoured twin of login/switch/add/refresh to register here.
     secure = sub.add_parser('secure', help='opt-in OS-keychain token storage (credential_process mode)')
     secure_sub = secure.add_subparsers(dest='secure_cmd', required=True)
     for name, summary in (
         ('enable', 'move a session into the OS keychain and rewrite its profiles as credential_process'),
         ('disable', 'revert a session to the stock plaintext cache and purge its keychain token'),
-        ('login', 're-authorize a secured session, refreshing its keychain token'),
     ):
         sp = secure_sub.add_parser(name, help=summary)
         sp.add_argument('-s', '--session', help="sso-session to operate on (default: current profile's)")
@@ -639,6 +933,14 @@ def _session_in_context(current: ProfileName, full_config: AwsConfig, override: 
     return session
 
 
+def _require_known_session(session: SessionName, full_config: AwsConfig) -> SessionName:
+    """Exit unless the sso-session is actually defined in ~/.aws/config."""
+    sso_sessions = full_config['sso_sessions']
+    if session not in sso_sessions:
+        raise SystemExit(f"unknown sso-session '{session}' — available: {', '.join(sorted(sso_sessions))}")
+    return session
+
+
 def main(argv: list[str]) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv or ['refresh'])
@@ -654,28 +956,41 @@ def main(argv: list[str]) -> None:
     _require_aws()
     current: ProfileName = os.environ.get('AWS_PROFILE', 'default')
     full_config: AwsConfig = botocore.session.Session().full_config
+    # Every branch below routes on the *session's* mode, so a secured session never falls back to a plaintext path
+    # (which would write a fresh token — refresh token and all — back into ~/.aws/sso/cache). Each also finishes
+    # validating its arguments before `_enter_secure_session`, which rewrites ~/.aws/config and deletes a token:
+    # a command that is about to fail must not heal and purge a session on its way to failing.
     if args.cmd == 'login':
-        session = _session_in_context(current, full_config, args.session)
-        if session not in full_config['sso_sessions']:
-            raise SystemExit(
-                f"unknown sso-session '{session}' — available: {', '.join(sorted(full_config['sso_sessions']))}"
-            )
-        cmd_login(session)
+        session = _require_known_session(_session_in_context(current, full_config, args.session), full_config)
+        if _session_is_secure(session, full_config):
+            _enter_secure_session(session, full_config).cmd_secure_login(session, full_config)
+        else:
+            cmd_login(session)
         _secure_mode_tip(session, full_config)
     elif args.cmd == 'switch':
-        if _is_secure(full_config['profiles'].get(current, {})):
-            from brolly import keychain
-
-            keychain.cmd_secure_switch(current, full_config)
+        # switch has no -s: it always repoints $AWS_PROFILE, so the session is whatever that profile names — left
+        # unresolved when it names none, so cmd_switch can raise its own profile-shaped error
+        session = full_config['profiles'].get(current, {}).get('sso_session')
+        if session and _session_is_secure(session, full_config):
+            _require_known_session(session, full_config)
+            _enter_secure_session(session, full_config).cmd_secure_switch(current, full_config)
         else:
             cmd_switch(current)
     elif args.cmd == 'refresh':
-        target = args.profile or current
-        secure = _is_secure(full_config['profiles'].get(target, {}))
-        cmd_refresh(target, _session_in_context(current, full_config, args.session), full_config, secure)
-    elif args.cmd == 'add':
         session = _session_in_context(current, full_config, args.session)
-        cmd_add(session, args.profile, full_config)
+        target = args.profile or current
+        _require_profile_in_session(target, session, full_config)
+        secure = _session_is_secure(session, full_config)
+        if secure:
+            _enter_secure_session(session, full_config)
+        cmd_refresh(target, session, full_config, secure)
+    elif args.cmd == 'add':
+        session = _require_known_session(_session_in_context(current, full_config, args.session), full_config)
+        _require_new_profile(args.profile, full_config)
+        if _session_is_secure(session, full_config):
+            _enter_secure_session(session, full_config).cmd_secure_add(session, args.profile, full_config)
+        else:
+            cmd_add(session, args.profile, full_config)
         _secure_mode_tip(session, full_config)
     elif args.cmd == 'ls':
         # ls distinguishes "unset" from "set to 'default'" for its footer, so pass the raw env (None when unset)
@@ -683,17 +998,11 @@ def main(argv: list[str]) -> None:
     elif args.cmd == 'secure':
         from brolly import keychain
 
-        session = _session_in_context(current, full_config, args.session)
-        if session not in full_config['sso_sessions']:
-            raise SystemExit(
-                f"unknown sso-session '{session}' — available: {', '.join(sorted(full_config['sso_sessions']))}"
-            )
+        session = _require_known_session(_session_in_context(current, full_config, args.session), full_config)
         if args.secure_cmd == 'enable':
             keychain.cmd_secure_enable(session, full_config, args.backend)
-        elif args.secure_cmd == 'disable':
-            keychain.cmd_secure_disable(session, full_config)
         else:
-            keychain.cmd_secure_login(session, full_config)
+            keychain.cmd_secure_disable(session, full_config)
     else:
         parser.print_usage(sys.stderr)
         raise SystemExit(2)
